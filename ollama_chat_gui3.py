@@ -11,14 +11,19 @@ Chat GUI for local Ollama models (Windows)
 
 TODO : édition/suppression message, GPU NVML, thèmes et raccourcis supplémentaires.
 
-> Installation : `pip install pyside6 requests psutil rich`
+> Installation : `pip install pyside6 requests psutil rich python-dotenv`
 > pyinstaller --onefile --windowed ollama_chat_gui3.py
+> $Env:OPENAI_API_KEY = "sk-svcacce..." ; .\ollama_chat_gui3.exe
 """
 from __future__ import annotations
 
+import os
+import dotenv  # ← nouveau
+dotenv.load_dotenv()  # lit .env à la racine du projet
+import httpx
+
 import html
 import json
-import os
 import re
 import time
 import uuid
@@ -46,6 +51,64 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QMenu,  # ← ajouté
 )
+
+# Mise à jour pour le nouveau SDK OpenAI
+from openai import OpenAI  # Nouveau SDK 1.0.0
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = None
+if OPENAI_API_KEY:
+    # Configuration du proxy si nécessaire via l'environnement httpx
+    #import httpx
+    #proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+    #try:
+    #    # httpx <0.18 attend un dict pour `proxies`
+    #    kwargs = {}
+    #    if proxy:
+    #        kwargs["proxies"] = {"http": proxy, "https": proxy}
+    #    http_client = httpx.Client(**kwargs)
+    #except TypeError:
+    #    # fallback si `proxies` n’est pas supporté
+    #    http_client = httpx.Client()
+
+    # laisse httpx lire automatiquement HTTP_PROXY/HTTPS_PROXY
+    http_client = httpx.Client(trust_env=True)
+        
+    # Initialisation du client OpenAI
+    client = OpenAI(
+        api_key=OPENAI_API_KEY,
+        http_client=http_client
+    )
+    
+    # Fonction pour lister les modèles OpenAI disponibles
+    def list_openai_models():
+        try:
+            models = client.models.list()
+            return [model.id for model in models.data 
+                   if "gpt" in model.id.lower() or "o3" in model.id.lower()]
+        except Exception as e:
+            print(f"Erreur lors de la récupération des modèles OpenAI: {e}")
+            return []
+
+    # Fonction pour utiliser l'API OpenAI chat completion
+    def chat_completion(model: str, messages: list[dict]):
+        """
+        Appelle l'API OpenAI chat completion
+        Args:
+            model: Nom du modèle (gpt-4.1-2025-04-14, o3-2025-04-16 etc.)
+            messages: Liste de messages au format [{"role": "user", "content": "..."}]
+        Returns:
+            Objet de réponse de l'API OpenAI
+        """
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                #temperature=0.7,
+            )
+            return response
+        except Exception as e:
+            print(f"Erreur lors de l'appel à OpenAI: {e}")
+            raise
 
 # ------------------------------- Config -------------------------------
 OLLAMA_URL = "http://localhost:11434"
@@ -176,6 +239,14 @@ class ChatWindow(QMainWindow):
         except requests.exceptions.RequestException as e:
             QMessageBox.warning(self, "Erreur de connexion Ollama", f"Impossible de lister les modèles : {e}\nVérifiez que Ollama est lancé.")
 
+        # ← nouveau: lister aussi les modèles OpenAI si clé présente
+        if OPENAI_API_KEY:
+            try:
+                openai_models = list_openai_models()
+                self.model_box.addItems([f"OpenAI: {mid}" for mid in openai_models])
+            except Exception as e:
+                QMessageBox.warning(self, "Erreur OpenAI", f"Impossible de lister les modèles OpenAI : {e}")
+
         self.model_box.currentTextChanged.connect(self.change_model)
 
         self.stats_label = QLabel("Tokens: 0 – 0 tok/s")
@@ -279,7 +350,19 @@ class ChatWindow(QMainWindow):
 
         payload = [{"role": m.role, "content": m.content} for m in conv]
         try:
-            resp, total_tokens, tok_s = self.client.chat(self.current_model, payload)
+            if self.current_model and self.current_model.startswith("OpenAI: "):
+                # appel OpenAI
+                model_name = self.current_model[len("OpenAI: "):]
+                start = time.time()
+                resp_obj = chat_completion(model=model_name, messages=payload)
+                duration = max(time.time() - start, 1e-6)
+                resp = resp_obj.choices[0].message.content
+                total_tokens = resp_obj.usage.total_tokens
+                tok_s = total_tokens / duration
+            else:
+                # appel Ollama existant
+                resp, total_tokens, tok_s = self.client.chat(self.current_model, payload)
+
             conv.append(Message("assistant", resp, total_tokens, tok_s))
             self.stats_label.setText(f"Tokens: {total_tokens} – {tok_s:.1f} tok/s")
             self.render_conversation()
