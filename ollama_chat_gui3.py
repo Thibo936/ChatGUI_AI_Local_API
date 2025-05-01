@@ -12,6 +12,7 @@ Chat GUI for local Ollama models (Windows)
 TODO : édition/suppression message, GPU NVML, thèmes et raccourcis supplémentaires.
 
 > Installation : `pip install pyside6 requests psutil rich`
+> pyinstaller --onefile --windowed ollama_chat_gui3.py
 """
 from __future__ import annotations
 
@@ -43,6 +44,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QHBoxLayout,
+    QMenu,  # ← ajouté
 )
 
 # ------------------------------- Config -------------------------------
@@ -98,6 +100,13 @@ class ChatWindow(QMainWindow):
         self.new_conv_btn.clicked.connect(self.new_conversation)
         self.conv_list = QListWidget()
         self.conv_list.itemClicked.connect(self.switch_conversation)
+
+        # --- AJOUT suppression via menu contextuel ---
+        self.conv_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.conv_list.customContextMenuRequested.connect(self._show_conv_context_menu)
+        self.del_conv_action = QAction("Supprimer conversation", self)
+        self.del_conv_action.triggered.connect(self.delete_conversation)
+        # ------------------------------------------------
 
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
@@ -389,6 +398,44 @@ class ChatWindow(QMainWindow):
         loaded_items.sort(key=lambda x: x.text())
         for item in loaded_items:
             self.conv_list.addItem(item)
+
+    # ------------------ menu contextuel ---------------------
+    def _show_conv_context_menu(self, pos):
+        item = self.conv_list.itemAt(pos)
+        if item:
+            menu = QMenu(self)
+            menu.addAction(self.del_conv_action)
+            menu.exec(self.conv_list.mapToGlobal(pos))
+
+    # ---------------- suppression conversation --------------
+    def delete_conversation(self):
+        item = self.conv_list.currentItem()
+        if not item:
+            return
+        cid = item.data(Qt.UserRole)
+        reply = QMessageBox.question(
+            self,
+            "Supprimer",
+            "Supprimer cette conversation ?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            # supprime fichier JSON
+            try:
+                (SAVE_DIR / f"{cid}.json").unlink()
+            except Exception:
+                pass
+            # supprime de la mémoire et de l'UI
+            self.conversations.pop(cid, None)
+            row = self.conv_list.row(item)
+            self.conv_list.takeItem(row)
+            # réinitialise l'affichage
+            if self.current_conv_id == cid:
+                if self.conv_list.count():
+                    self.conv_list.setCurrentRow(0)
+                    self.switch_conversation(self.conv_list.currentItem())
+                else:
+                    self.new_conversation()
 
 # ============================== run ================================
 if __name__ == "__main__":
