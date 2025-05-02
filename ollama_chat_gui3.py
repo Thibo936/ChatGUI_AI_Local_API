@@ -13,7 +13,7 @@ TODO : édition/suppression message, GPU NVML, thèmes et raccourcis suppléme
 
 > Installation : `pip install pyside6 requests psutil rich python-dotenv`
 > pyinstaller --onefile --windowed ollama_chat_gui3.py
-> $Env:OPENAI_API_KEY = "sk-svcacce..." ; .\ollama_chat_gui3.exe
+> $Env:OPENAI_API_KEY = "sk-svcacce..." ;
 """
 from __future__ import annotations
 
@@ -158,6 +158,10 @@ class ChatWindow(QMainWindow):
         self.current_conv_id: str | None = None
         self.reason_states: dict[str, bool] = {}
 
+        # — Initialisation des favoris —
+        self.fav_file = SAVE_DIR / "model_favorites.json"
+        self.favorites = self._load_model_favorites()
+
         # LEFT PANEL --------------------------------------------------
         self.new_conv_btn = QPushButton("➕ Nouvelle conversation")
         self.new_conv_btn.clicked.connect(self.new_conversation)
@@ -234,19 +238,12 @@ class ChatWindow(QMainWindow):
         self.send_btn.clicked.connect(self.send_message)
 
         self.model_box = QComboBox()
-        try:
-            self.model_box.addItems(self.client.list_models())
-        except requests.exceptions.RequestException as e:
-            QMessageBox.warning(self, "Erreur de connexion Ollama", f"Impossible de lister les modèles : {e}\nVérifiez que Ollama est lancé.")
+        # menu contextuel pour ajouter/retirer un favori
+        self.model_box.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.model_box.customContextMenuRequested.connect(self._show_model_context_menu)
 
-        # ← nouveau: lister aussi les modèles OpenAI si clé présente
-        if OPENAI_API_KEY:
-            try:
-                openai_models = list_openai_models()
-                self.model_box.addItems([f"OpenAI: {mid}" for mid in openai_models])
-            except Exception as e:
-                QMessageBox.warning(self, "Erreur OpenAI", f"Impossible de lister les modèles OpenAI : {e}")
-
+        # remplissage initial
+        self._populate_model_box()
         self.model_box.currentTextChanged.connect(self.change_model)
 
         self.stats_label = QLabel("Tokens: 0 – 0 tok/s")
@@ -303,6 +300,82 @@ class ChatWindow(QMainWindow):
     def _update_resource_stats(self):
         self.res_label.setText(f"CPU: {psutil.cpu_percent():.0f}%  RAM: {psutil.virtual_memory().percent:.0f}%")
 
+    # ---------------------- Favoris modèles ------------------------
+    def _load_model_favorites(self) -> list[str]:
+        try:
+            data = json.loads((self.fav_file).read_text(encoding='utf-8'))
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+        return []
+
+    def _save_model_favorites(self):
+        try:
+            (self.fav_file).write_text(json.dumps(self.favorites, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception as e:
+            print(f"Erreur sauvegarde favoris : {e}")
+
+    def _populate_model_box(self):
+        # récupère tous les modèles
+        models: list[str] = []
+        try:
+            models = self.client.list_models()
+        except requests.exceptions.RequestException as e:
+            QMessageBox.warning(self, "Erreur Ollama", f"Impossible de lister les modèles : {e}")
+        if OPENAI_API_KEY:
+            try:
+                openai_models = list_openai_models()
+                models += [f"OpenAI: {m}" for m in openai_models]
+            except Exception as e:
+                QMessageBox.warning(self, "Erreur OpenAI", f"Impossible de lister OpenAI : {e}")
+        # supprime les doublons
+        models = list(dict.fromkeys(models))
+        # priorise les favoris
+        favs = [m for m in self.favorites if m in models]
+        others = sorted([m for m in models if m not in self.favorites])
+        # mise à jour de la combo avec étoile pour les favoris
+        prev_model = self.current_model
+        self.model_box.clear()
+        for m in favs:
+            self.model_box.addItem(f"★ {m}", m)
+        for m in others:
+            self.model_box.addItem(m, m)
+        # restaure la sélection
+        if prev_model:
+            for i in range(self.model_box.count()):
+                if self.model_box.itemData(i) == prev_model:
+                    self.model_box.setCurrentIndex(i)
+                    break
+
+    def _show_model_context_menu(self, pos):
+        idx = self.model_box.currentIndex()
+        if idx < 0:
+            return
+        model_name = self.model_box.itemData(idx)
+        if not model_name:
+            return
+        menu = QMenu(self)
+        if model_name in self.favorites:
+            action = menu.addAction("Retirer des favoris")
+        else:
+            action = menu.addAction("Ajouter aux favoris")
+        action.triggered.connect(lambda: self._toggle_favorite(model_name))
+        menu.exec(self.model_box.mapToGlobal(pos))
+
+    def _toggle_favorite(self, model_name: str):
+        if model_name in self.favorites:
+            self.favorites.remove(model_name)
+        else:
+            self.favorites.append(model_name)
+        self._save_model_favorites()
+        # on recrée la liste, on restaure la sélection
+        prev = self.model_box.currentText()
+        self._populate_model_box()
+        idx = self.model_box.findText(prev)
+        if idx >= 0:
+            self.model_box.setCurrentIndex(idx)
+
     # ---------------------- UI helpers ------------------------------
     def _auto_resize(self):
         h = self.msg_edit.document().size().height() + 10
@@ -332,8 +405,11 @@ class ChatWindow(QMainWindow):
         self.render_conversation()
 
     # ----------------------- Model change ---------------------------
-    def change_model(self, model: str):
-        self.current_model = model
+    def change_model(self, _):
+        # récupère le model réel stocké en userData
+        idx = self.model_box.currentIndex()
+        model_name = self.model_box.itemData(idx)
+        self.current_model = model_name
 
     # -------------------------- Send -------------------------------
     def send_message(self):
