@@ -12,7 +12,7 @@ Chat GUI for local Ollama models (Windows)
 TODO : édition/suppression message, GPU NVML, thèmes et raccourcis supplémentaires.
 
 > Installation : `pip install pyside6 requests psutil rich python-dotenv llama-cpp-python`
-> pyinstaller --onefile --windowed ollama_chat_gui3.py
+> pyinstaller --onefile --windowed --collect-all llama_cpp ollama_chat_gui3.py
 > $Env:OPENAI_API_KEY = "sk-svcacce..." ;
 
 ‼️‼️ model .gguf à placer dans le même répertoire que le script, ou dans un sous‑répertoire `models` !
