@@ -1,30 +1,8 @@
-# chat_ollama.py
-"""
-Chat GUI for local Ollama models (Windows)
------------------------------------------
-• **Nouveau** bouton (➕) pour démarrer un fil. Titres auto‑générés.  
-• Vue chat Markdown : blocs de code rendus, et **<think></think>** affichés façon *LM Studio* (encadré avec flèche ▶/▼ pour ouvrir‑fermer).  
-• Éditeur auto‑redimensionnable, **Ctrl+Entrée** pour envoyer.  
-• Sélecteur de modèle (dynamique via `ollama list`).  
-• Stats : tokens & tok/s + CPU/RAM.  
-• Sauvegarde JSON dans `%APPDATA%/OllamaChats`.  
-
-TODO : édition/suppression message, GPU NVML, thèmes et raccourcis supplémentaires.
-
-> Installation : `pip install pyside6 requests psutil rich python-dotenv llama-cpp-python`
-> pyinstaller --onefile --windowed --collect-all llama_cpp ollama_chat_gui3.py
-> $Env:OPENAI_API_KEY = "sk-svcacce..." ;
-
-‼️‼️ model .gguf à placer dans le même répertoire que le script, ou dans un sous‑répertoire `models` !
-> famille de modèles compatibles avec Llama.cpp (ex. `llama2-7b-chat.gguf` , `gemma3:4b.gguf`, etc.)
-> famille de modèles incompatibles avec Llama.cpp (ex. `qwen3-1.7b`, etc.)
-
-"""
 from __future__ import annotations
 
 import os
 import dotenv
-dotenv.load_dotenv()  # lit .env à la racine du projet
+dotenv.load_dotenv()
 import httpx
 import html
 import json
@@ -153,7 +131,7 @@ def start_ollama_server():
 class ChatWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Ollama Chat")
+        self.setWindowTitle("ChatGUI_AI_Local_API")
         self.resize(960, 640)
 
         self.client = OllamaClient()
