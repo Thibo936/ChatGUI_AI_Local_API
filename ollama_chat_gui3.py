@@ -11,17 +11,21 @@ Chat GUI for local Ollama models (Windows)
 
 TODO : édition/suppression message, GPU NVML, thèmes et raccourcis supplémentaires.
 
-> Installation : `pip install pyside6 requests psutil rich python-dotenv`
+> Installation : `pip install pyside6 requests psutil rich python-dotenv llama-cpp-python`
 > pyinstaller --onefile --windowed ollama_chat_gui3.py
 > $Env:OPENAI_API_KEY = "sk-svcacce..." ;
+
+‼️‼️ model .gguf à placer dans le même répertoire que le script, ou dans un sous‑répertoire `models` !
+> famille de modèles compatibles avec Llama.cpp (ex. `llama2-7b-chat.gguf` , `gemma3:4b.gguf`, etc.)
+> famille de modèles incompatibles avec Llama.cpp (ex. `qwen3-1.7b`, etc.)
+
 """
 from __future__ import annotations
 
 import os
-import dotenv  # ← nouveau
+import dotenv
 dotenv.load_dotenv()  # lit .env à la racine du projet
 import httpx
-
 import html
 import json
 import re
@@ -32,6 +36,8 @@ from pathlib import Path
 
 import psutil
 import requests
+import subprocess
+from llama_cpp import Llama
 from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QTextCursor, QTextOption, QDesktopServices
 from PySide6.QtWidgets import (
@@ -49,37 +55,25 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QHBoxLayout,
-    QMenu,  # ← ajouté
+    QMenu,
 )
 
+# racine models GGUF
+MODEL_DIR = Path(__file__).parent / "models"
+MODEL_DIR.mkdir(exist_ok=True)
+
 # Mise à jour pour le nouveau SDK OpenAI
-from openai import OpenAI  # Nouveau SDK 1.0.0
+from openai import OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = None
 if OPENAI_API_KEY:
-    # Configuration du proxy si nécessaire via l'environnement httpx
-    #import httpx
-    #proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
-    #try:
-    #    # httpx <0.18 attend un dict pour `proxies`
-    #    kwargs = {}
-    #    if proxy:
-    #        kwargs["proxies"] = {"http": proxy, "https": proxy}
-    #    http_client = httpx.Client(**kwargs)
-    #except TypeError:
-    #    # fallback si `proxies` n’est pas supporté
-    #    http_client = httpx.Client()
-
-    # laisse httpx lire automatiquement HTTP_PROXY/HTTPS_PROXY
     http_client = httpx.Client(trust_env=True)
         
-    # Initialisation du client OpenAI
     client = OpenAI(
         api_key=OPENAI_API_KEY,
         http_client=http_client
     )
     
-    # Fonction pour lister les modèles OpenAI disponibles
     def list_openai_models():
         try:
             models = client.models.list()
@@ -89,21 +83,11 @@ if OPENAI_API_KEY:
             print(f"Erreur lors de la récupération des modèles OpenAI: {e}")
             return []
 
-    # Fonction pour utiliser l'API OpenAI chat completion
     def chat_completion(model: str, messages: list[dict]):
-        """
-        Appelle l'API OpenAI chat completion
-        Args:
-            model: Nom du modèle (gpt-4.1-2025-04-14, o3-2025-04-16 etc.)
-            messages: Liste de messages au format [{"role": "user", "content": "..."}]
-        Returns:
-            Objet de réponse de l'API OpenAI
-        """
         try:
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
-                #temperature=0.7,
             )
             return response
         except Exception as e:
@@ -144,6 +128,20 @@ class OllamaClient:
         total_tokens = data.get("usage", {}).get("total_tokens", 0)
         return data["message"]["content"], total_tokens, total_tokens / duration
 
+# --------------------------- Ollama server ---------------------------
+def is_ollama_running() -> bool:
+    try:
+        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=2)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+def start_ollama_server():
+    try:
+        subprocess.Popen(["ollama", "serve"], creationflags=subprocess.CREATE_NEW_CONSOLE)
+    except Exception as e:
+        QMessageBox.critical(None, "Erreur Ollama", f"Impossible de lancer Ollama : {e}")
+
 # ---------------------------- Main window ----------------------------
 class ChatWindow(QMainWindow):
     def __init__(self):
@@ -151,29 +149,26 @@ class ChatWindow(QMainWindow):
         self.setWindowTitle("Ollama Chat")
         self.resize(960, 640)
 
-        # STATE -------------------------------------------------------
         self.client = OllamaClient()
         self.current_model: str | None = None
         self.conversations: dict[str, list[Message]] = {}
         self.current_conv_id: str | None = None
         self.reason_states: dict[str, bool] = {}
+        self.local_models: dict[str, Path] = {}     # nom -> chemin
+        self.llama_models: dict[str, Llama] = {}    # cache des instances
 
-        # — Initialisation des favoris —
         self.fav_file = SAVE_DIR / "model_favorites.json"
         self.favorites = self._load_model_favorites()
 
-        # LEFT PANEL --------------------------------------------------
         self.new_conv_btn = QPushButton("➕ Nouvelle conversation")
         self.new_conv_btn.clicked.connect(self.new_conversation)
         self.conv_list = QListWidget()
         self.conv_list.itemClicked.connect(self.switch_conversation)
 
-        # --- AJOUT suppression via menu contextuel ---
         self.conv_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.conv_list.customContextMenuRequested.connect(self._show_conv_context_menu)
         self.del_conv_action = QAction("Supprimer conversation", self)
         self.del_conv_action.triggered.connect(self.delete_conversation)
-        # ------------------------------------------------
 
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
@@ -181,7 +176,6 @@ class ChatWindow(QMainWindow):
         left_layout.addWidget(self.new_conv_btn)
         left_layout.addWidget(self.conv_list, 1)
 
-        # RIGHT PANEL -------------------------------------------------
         self.chat_view = QTextBrowser()
         self.chat_view.setOpenExternalLinks(False)
         self.chat_view.setOpenLinks(False)
@@ -198,12 +192,12 @@ class ChatWindow(QMainWindow):
                 margin-top: 2px;
                 display: inline-block;
                 max-width: 95%;
-                white-space: pre-wrap; /* Ensure wrapping */
-                word-wrap: break-word; /* Break long words */
+                white-space: pre-wrap;
+                word-wrap: break-word;
             }
             .code-block {
-                background-color: #282c34; /* Dark background for code */
-                color: #abb2bf; /* Light text for code */
+                background-color: #282c34;
+                color: #abb2bf;
                 border: 1px solid #ccc;
                 padding: 10px;
                 margin: 8px 0;
@@ -238,18 +232,15 @@ class ChatWindow(QMainWindow):
         self.send_btn.clicked.connect(self.send_message)
 
         self.model_box = QComboBox()
-        # menu contextuel pour ajouter/retirer un favori
         self.model_box.setContextMenuPolicy(Qt.CustomContextMenu)
         self.model_box.customContextMenuRequested.connect(self._show_model_context_menu)
 
-        # remplissage initial
         self._populate_model_box()
         self.model_box.currentTextChanged.connect(self.change_model)
 
         self.stats_label = QLabel("Tokens: 0 – 0 tok/s")
         self.res_label = QLabel("CPU: 0%  RAM: 0%")
 
-        # Layouts -----------------------------------------------------
         editor_bar = QHBoxLayout()
         editor_bar.addWidget(self.msg_edit, 1)
         editor_bar.addWidget(self.send_btn)
@@ -273,11 +264,9 @@ class ChatWindow(QMainWindow):
         splitter.setStretchFactor(1, 4)
         self.setCentralWidget(splitter)
 
-        # Shortcuts / timers -----------------------------------------
         self.msg_edit.keyPressEvent = self._key_press_override
         QTimer.singleShot(0, self._start_stats_timer)
 
-        # Init --------------------------------------------------------
         self.change_model(self.model_box.currentText())
         self.load_conversations()
         if not self.conversations:
@@ -291,7 +280,6 @@ class ChatWindow(QMainWindow):
                     self.switch_conversation(item)
                     break
 
-    # -------------------------- Timers -----------------------------
     def _start_stats_timer(self):
         self.stats_timer = QTimer(self)
         self.stats_timer.timeout.connect(self._update_resource_stats)
@@ -300,7 +288,6 @@ class ChatWindow(QMainWindow):
     def _update_resource_stats(self):
         self.res_label.setText(f"CPU: {psutil.cpu_percent():.0f}%  RAM: {psutil.virtual_memory().percent:.0f}%")
 
-    # ---------------------- Favoris modèles ------------------------
     def _load_model_favorites(self) -> list[str]:
         try:
             data = json.loads((self.fav_file).read_text(encoding='utf-8'))
@@ -316,37 +303,40 @@ class ChatWindow(QMainWindow):
         except Exception as e:
             print(f"Erreur sauvegarde favoris : {e}")
 
+    def _scan_local_models(self) -> dict[str, Path]:
+        d: dict[str, Path] = {}
+        for f in MODEL_DIR.glob("*.gguf"):
+            d[f.stem] = f
+        return d
+
     def _populate_model_box(self):
-        # récupère tous les modèles
-        models: list[str] = []
+        self.favorites = self._load_model_favorites()
+        models = []
         try:
             models = self.client.list_models()
-        except requests.exceptions.RequestException as e:
-            QMessageBox.warning(self, "Erreur Ollama", f"Impossible de lister les modèles : {e}")
+        except:
+            QMessageBox.warning(self, "Ollama", "Erreur liste modèles")
         if OPENAI_API_KEY:
             try:
-                openai_models = list_openai_models()
-                models += [f"OpenAI: {m}" for m in openai_models]
-            except Exception as e:
-                QMessageBox.warning(self, "Erreur OpenAI", f"Impossible de lister OpenAI : {e}")
-        # supprime les doublons
+                openai = list_openai_models()
+                models += [f"OpenAI: {m}" for m in openai]
+            except:
+                pass
+        self.local_models = self._scan_local_models()
+        models += [f"Local: {name}" for name in self.local_models]
         models = list(dict.fromkeys(models))
-        # priorise les favoris
         favs = [m for m in self.favorites if m in models]
-        others = sorted([m for m in models if m not in self.favorites])
-        # mise à jour de la combo avec étoile pour les favoris
-        prev_model = self.current_model
+        oth = sorted([m for m in models if m not in self.favorites])
+        prev = self.current_model
         self.model_box.clear()
         for m in favs:
             self.model_box.addItem(f"★ {m}", m)
-        for m in others:
+        for m in oth:
             self.model_box.addItem(m, m)
-        # restaure la sélection
-        if prev_model:
-            for i in range(self.model_box.count()):
-                if self.model_box.itemData(i) == prev_model:
-                    self.model_box.setCurrentIndex(i)
-                    break
+        if prev:
+            i = self.model_box.findData(prev)
+            if i >= 0:
+                self.model_box.setCurrentIndex(i)
 
     def _show_model_context_menu(self, pos):
         idx = self.model_box.currentIndex()
@@ -369,14 +359,12 @@ class ChatWindow(QMainWindow):
         else:
             self.favorites.append(model_name)
         self._save_model_favorites()
-        # on recrée la liste, on restaure la sélection
         prev = self.model_box.currentText()
         self._populate_model_box()
         idx = self.model_box.findText(prev)
         if idx >= 0:
             self.model_box.setCurrentIndex(idx)
 
-    # ---------------------- UI helpers ------------------------------
     def _auto_resize(self):
         h = self.msg_edit.document().size().height() + 10
         self.msg_edit.setFixedHeight(min(int(h), 150))
@@ -387,7 +375,6 @@ class ChatWindow(QMainWindow):
         else:
             QTextEdit.keyPressEvent(self.msg_edit, e)
 
-    # ------------------ Conversation management ---------------------
     def new_conversation(self):
         cid = str(uuid.uuid4())
         self.conversations[cid] = []
@@ -404,14 +391,11 @@ class ChatWindow(QMainWindow):
         self.reason_states.clear()
         self.render_conversation()
 
-    # ----------------------- Model change ---------------------------
     def change_model(self, _):
-        # récupère le model réel stocké en userData
         idx = self.model_box.currentIndex()
         model_name = self.model_box.itemData(idx)
         self.current_model = model_name
 
-    # -------------------------- Send -------------------------------
     def send_message(self):
         txt = self.msg_edit.toPlainText().strip()
         if not txt:
@@ -427,7 +411,6 @@ class ChatWindow(QMainWindow):
         payload = [{"role": m.role, "content": m.content} for m in conv]
         try:
             if self.current_model and self.current_model.startswith("OpenAI: "):
-                # appel OpenAI
                 model_name = self.current_model[len("OpenAI: "):]
                 start = time.time()
                 resp_obj = chat_completion(model=model_name, messages=payload)
@@ -435,8 +418,25 @@ class ChatWindow(QMainWindow):
                 resp = resp_obj.choices[0].message.content
                 total_tokens = resp_obj.usage.total_tokens
                 tok_s = total_tokens / duration
+            elif self.current_model and self.current_model.startswith("Local: "):
+                name = self.current_model[len("Local: "):]
+                path = self.local_models.get(name)
+                if not path:
+                    raise RuntimeError(f"Modèle local introuvable : {name}")
+                llm = self.llama_models.get(name)
+                if not llm:
+                    llm = Llama(model_path=str(path))
+                    self.llama_models[name] = llm
+                prompt = "\n".join(f"{m.role}: {m.content}" for m in self.conversations[self.current_conv_id])
+                start = time.time()
+                output = ""
+                for chunk in llm(prompt, max_tokens=512, stop=["user:", "assistant:"], stream=True):
+                    output += chunk["choices"][0]["text"]
+                resp = output
+                duration = max(time.time() - start, 1e-6)
+                total_tokens = len(resp.split())  # estimation grossière des tokens
+                tok_s = total_tokens / duration if total_tokens else 0.0
             else:
-                # appel Ollama existant
                 resp, total_tokens, tok_s = self.client.chat(self.current_model, payload)
 
             conv.append(Message("assistant", resp, total_tokens, tok_s))
@@ -446,9 +446,7 @@ class ChatWindow(QMainWindow):
         except Exception as err:
             QMessageBox.critical(self, "Erreur", str(err))
 
-    # --------------------- Rendering engine -------------------------
     def _format_assistant(self, txt: str) -> str:
-        """Convert assistant raw text to HTML with collapsible reasoning box and styled code blocks."""
         def _repl(m: re.Match) -> str:
             content = m.group(1).strip()
             rid = str(uuid.uuid5(uuid.NAMESPACE_OID, content))[:8]
@@ -506,7 +504,6 @@ class ChatWindow(QMainWindow):
         self.chat_view.setHtml(html_content)
         self.chat_view.moveCursor(QTextCursor.End)
 
-    # ----------------------- Toggle reasoning -----------------------
     def _anchor_clicked(self, url: QUrl):
         scheme = url.scheme()
         if scheme == "reason":
@@ -519,7 +516,6 @@ class ChatWindow(QMainWindow):
         elif scheme in ["http", "https"]:
             QDesktopServices.openUrl(url)
 
-    # -------------------- Persistence helper ------------------------
     def _save(self):
         if not self.current_conv_id:
             return
@@ -535,6 +531,9 @@ class ChatWindow(QMainWindow):
         self.conv_list.clear()
         loaded_items = []
         for file_path in SAVE_DIR.glob("*.json"):
+            # Ignorer le fichier des favoris
+            if file_path.name == "model_favorites.json":
+                continue
             try:
                 cid = file_path.stem
                 content = file_path.read_text(encoding='utf-8')
@@ -558,7 +557,6 @@ class ChatWindow(QMainWindow):
         for item in loaded_items:
             self.conv_list.addItem(item)
 
-    # ------------------ menu contextuel ---------------------
     def _show_conv_context_menu(self, pos):
         item = self.conv_list.itemAt(pos)
         if item:
@@ -566,7 +564,6 @@ class ChatWindow(QMainWindow):
             menu.addAction(self.del_conv_action)
             menu.exec(self.conv_list.mapToGlobal(pos))
 
-    # ---------------- suppression conversation --------------
     def delete_conversation(self):
         item = self.conv_list.currentItem()
         if not item:
@@ -579,16 +576,13 @@ class ChatWindow(QMainWindow):
             QMessageBox.Yes | QMessageBox.No
         )
         if reply == QMessageBox.Yes:
-            # supprime fichier JSON
             try:
                 (SAVE_DIR / f"{cid}.json").unlink()
             except Exception:
                 pass
-            # supprime de la mémoire et de l'UI
             self.conversations.pop(cid, None)
             row = self.conv_list.row(item)
             self.conv_list.takeItem(row)
-            # réinitialise l'affichage
             if self.current_conv_id == cid:
                 if self.conv_list.count():
                     self.conv_list.setCurrentRow(0)
@@ -598,6 +592,15 @@ class ChatWindow(QMainWindow):
 
 # ============================== run ================================
 if __name__ == "__main__":
+    if not is_ollama_running():
+        start_ollama_server()
+        import time
+        for _ in range(10):
+            if is_ollama_running():
+                break
+            time.sleep(1)
+        else:
+            QMessageBox.critical(None, "Erreur Ollama", "Impossible de démarrer le serveur Ollama.")
     app = QApplication([])
     win = ChatWindow()
     win.show()
