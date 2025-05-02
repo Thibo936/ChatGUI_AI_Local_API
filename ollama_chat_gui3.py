@@ -58,8 +58,15 @@ from PySide6.QtWidgets import (
     QMenu,
 )
 
-# racine models GGUF
-MODEL_DIR = Path(__file__).parent / "models"
+import sys
+
+if getattr(sys, 'frozen', False):
+    # Exécuté via PyInstaller
+    BASE_DIR = Path(sys.executable).parent
+else:
+    BASE_DIR = Path(__file__).parent
+
+MODEL_DIR = BASE_DIR / "models"
 MODEL_DIR.mkdir(exist_ok=True)
 
 # Mise à jour pour le nouveau SDK OpenAI
@@ -305,7 +312,9 @@ class ChatWindow(QMainWindow):
 
     def _scan_local_models(self) -> dict[str, Path]:
         d: dict[str, Path] = {}
+        print("Scan du dossier models :", MODEL_DIR)
         for f in MODEL_DIR.glob("*.gguf"):
+            print("Trouvé :", f)
             d[f.stem] = f
         return d
 
