@@ -1,0 +1,9 @@
+llama-cpp-python
+py-cpuinfo
+PySide6
+openai
+python-dotenv
+httpx
+psutil
+requests
+rich

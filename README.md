@@ -1,167 +1,123 @@
-# OllamaChat – GUI Interface for Local and Remote AI Models
+# ChatGUI_AI_Local_API
 
-## Description
+## English
 
-OllamaChat is a Python graphical interface that lets you interact with several kinds of artificial‑intelligence models:
+### Description
 
-* **Locally hosted Ollama models**
-* **GGUF models** via *llama‑cpp‑python*
-* **OpenAI models** through the OpenAI API
+ChatGUI_AI_Local_API is a graphical user interface (GUI) application that allows you to chat with various AI models. It supports both local models via Ollama and cloud-based models via the OpenAI API. The application provides a simple interface to manage multiple conversations, select different AI models, and monitor resource usage.
 
-## Key Features
+### Features
 
-* **Interface**
+*   **Multi-Model Support:** Interact with local models (via Ollama) and OpenAI models (GPT series).
+*   **Conversation Management:** Create, switch between, and delete multiple chat conversations.
+*   **Local Storage:** Conversations are saved locally in JSON format.
+*   **Model Favorites:** Mark preferred models as favorites for quick access.
+*   **Resource Monitoring:** Displays CPU and RAM usage.
+*   **Markdown Rendering:** Basic Markdown support for assistant messages (bold, italics, code blocks).
+*   **Dependency Checks:** Checks for necessary dependencies like VC++ Runtime and Python packages on startup.
+*   **Cross-Platform:** Built with PySide6, aiming for cross-platform compatibility (primarily tested on Windows).
 
-  * Markdown rendering in replies (bold, italics, etc.)
-  * Code blocks with improved formatting
-  * “Thinking” mode with collapsible `<think></think>` tags (▶/▼)
+### Requirements
 
-* **Multi‑Model Management**
+*   Python 3.x
+*   Ollama (for local models): [https://ollama.com/](https://ollama.com/)
+*   Required Python packages (see `requirements.txt` - installation attempted automatically):
+    *   `PySide6`
+    *   `requests`
+    *   `psutil`
+    *   `python-dotenv`
+    *   `openai`
+    *   `httpx`
+*   (Windows) Microsoft Visual C++ Redistributable for Visual Studio 2015-2022 (x64). Installation prompted if missing.
+*   (Optional) OpenAI API Key for using OpenAI models.
 
-  * Automatic detection of available Ollama models
-  * Loading of local GGUF models (`.gguf`)
-  * Integration of OpenAI models (requires an API key)
-  * Favourites system for frequently used models (★)
+### Installation
 
-* **Conversation Management**
+1.  **Clone the repository:**
+    ```bash
+    git clone <repository_url>
+    cd ChatGUI_AI_Local_API
+    ```
+2.  **Install Ollama:** Download and install Ollama from [https://ollama.com/](https://ollama.com/). Ensure the Ollama server is running.
+3.  **Install Python dependencies:** The application attempts to install missing dependencies automatically. You can also install them manually:
+    ```bash
+    pip install -r requirements.txt
+    ```
+    *(Note: A `requirements.txt` file might need to be created based on the imports in the script if not already present).*
+4.  **(Optional) Set up OpenAI API Key:** Create a `.env` file in the project directory and add your OpenAI API key:
+    ```env
+    OPENAI_API_KEY='your_api_key_here'
+    ```
 
-  * Automatic saving to `%APPDATA%/OllamaChats`
-  * Create and delete conversations
-  * Titles auto‑generated from the first user message
+### Usage
 
-* **User Experience**
+1.  Run the Python script:
+    ```bash
+    python ollama_chat_gui3.py
+    ```
+2.  The application will start. If Ollama is not running, it might attempt to start it (depending on system configuration).
+3.  Select an available AI model from the dropdown list (local models fetched from Ollama, OpenAI models if the API key is configured).
+4.  Start chatting! Use the "➕ Nouvelle conversation" button to create new chats.
+5.  Conversations are saved automatically.
 
-  * Auto‑resizing editor
-  * Send with **Ctrl + Enter**
-  * Real‑time statistics (tokens, tok/s, CPU/RAM)
+---
 
-## Installation
+## Français
 
-### Prerequisites
+### Description
 
-* Python 3.8 or newer
-* **Ollama** installed for Ollama models *(optional)*
-* **llama‑cpp‑python** for GGUF models *(optional)*
-* **openai** package for OpenAI models *(optional)*
+ChatGUI_AI_Local_API est une application d'interface graphique (GUI) qui vous permet de discuter avec divers modèles d'IA. Elle prend en charge à la fois les modèles locaux via Ollama et les modèles basés sur le cloud via l'API OpenAI. L'application fournit une interface simple pour gérer plusieurs conversations, sélectionner différents modèles d'IA et surveiller l'utilisation des ressources.
 
-### Dependencies
+### Fonctionnalités
 
-```bash
-pip install pyside6 requests psutil rich python-dotenv llama-cpp-python
-```
-
-### Configuration
-
-1. Place your GGUF models in the same folder as the script or inside a `models/` sub‑folder.
-2. To use OpenAI, create a `.env` file or set an environment variable:
-
-   ```
-   OPENAI_API_KEY=your_api_key
-   ```
-
-## Usage
-
-### Launch
-
-```bash
-python ollama_chat_gui3.py
-```
-
-The Ollama server starts automatically if required.
-
-### Interactions
-
-* **New conversation**: Click **➕ New conversation**
-* **Send messages**: Type your message, then click **Send** or press **Ctrl + Enter**
-* **Switch model**: Select a model from the drop‑down list at the bottom
-* **Favourites**: Right‑click a model to add or remove it from favourites
-
-## Building a Stand‑Alone Executable
-
-```bash
-pyinstaller --onefile --windowed --collect-all llama_cpp --collect-all PySide6 --name ChatLite ollama_chat_gui3.py
-```
-
-## Model Compatibility
-
-* **Ollama**: Any model reachable via the Ollama API
-* **GGUF**: Models compatible with *llama.cpp* (e.g. `llama2-7b-chat.gguf`, `gemma3:4b.gguf`)
-* **OpenAI**: GPT and other models accessible through the OpenAI API
-
---
-
-OllamaChat - Interface GUI pour modèles IA locaux et distants
-
-## Description
-OllamaChat est une interface graphique Python qui permet d'interagir avec différents modèles d'intelligence artificielle:
-- Modèles Ollama hébergés localement
-- Modèles GGUF via llama-cpp-python
-- API OpenAI
-
-## Fonctionnalités principales
-
-- **Interface**
-  - Rendu Markdown pour les réponses (gras, italique, etc.)
-  - Blocs de code avec formatage amélioré
-  - Mode "pensée" avec balises `<think></think>` pliables (▶/▼)
-
-- **Gestion multi-modèles**
-  - Détection automatique des modèles Ollama disponibles
-  - Chargement des modèles GGUF locaux (.gguf)
-  - Intégration des modèles OpenAI (avec clé API)
-  - Système de favoris pour les modèles fréquemment utilisés (★)
-
-- **Gestion des conversations**
-  - Sauvegarde automatique dans `%APPDATA%/OllamaChats`
-  - Création et suppression de conversations
-  - Titres générés automatiquement à partir du premier message
-
-- **Expérience utilisateur**
-  - Éditeur auto-redimensionnable
-  - Envoi par Ctrl+Entrée
-  - Statistiques temps réel (tokens, tok/s, CPU/RAM)
-
-## Installation
+*   **Support Multi-Modèles :** Interagissez avec des modèles locaux (via Ollama) et des modèles OpenAI (série GPT).
+*   **Gestion des Conversations :** Créez, basculez entre et supprimez plusieurs conversations de chat.
+*   **Stockage Local :** Les conversations sont sauvegardées localement au format JSON.
+*   **Modèles Favoris :** Marquez les modèles préférés comme favoris pour un accès rapide.
+*   **Surveillance des Ressources :** Affiche l'utilisation du CPU et de la RAM.
+*   **Rendu Markdown :** Prise en charge basique du Markdown pour les messages de l'assistant (gras, italique, blocs de code).
+*   **Vérification des Dépendances :** Vérifie les dépendances nécessaires comme le Runtime VC++ et les paquets Python au démarrage.
+*   **Multiplateforme :** Construit avec PySide6, visant la compatibilité multiplateforme (principalement testé sous Windows).
 
 ### Prérequis
-- Python 3.8+
-- Ollama installé pour les modèles Ollama (facultatif)
-- llama-cpp-python pour les modèles GGUF (facultatif)
-- OpenAI pour les modèles OpenAI (facultatif)
 
-### Dépendances
-```bash
-pip install pyside6 requests psutil rich python-dotenv llama-cpp-python
-```
+*   Python 3.x
+*   Ollama (pour les modèles locaux) : [https://ollama.com/](https://ollama.com/)
+*   Paquets Python requis (voir `requirements.txt` - installation tentée automatiquement) :
+    *   `PySide6`
+    *   `requests`
+    *   `psutil`
+    *   `python-dotenv`
+    *   `openai`
+    *   `httpx`
+*   (Windows) Microsoft Visual C++ Redistributable pour Visual Studio 2015-2022 (x64). L'installation est proposée si manquant.
+*   (Optionnel) Clé API OpenAI pour utiliser les modèles OpenAI.
 
-### Configuration
-1. Placez vos modèles GGUF dans le même répertoire que le script ou dans un sous-dossier `models/`
-2. Pour utiliser OpenAI, créez un fichier `.env` ou définissez la variable d'environnement:
-   ```
-   OPENAI_API_KEY=votre_clé_api
-   ```
+### Installation
 
-## Utilisation
+1.  **Cloner le dépôt :**
+    ```bash
+    git clone <url_du_depot>
+    cd ChatGUI_AI_Local_API
+    ```
+2.  **Installer Ollama :** Téléchargez et installez Ollama depuis [https://ollama.com/](https://ollama.com/). Assurez-vous que le serveur Ollama est en cours d'exécution.
+3.  **Installer les dépendances Python :** L'application tente d'installer automatiquement les dépendances manquantes. Vous pouvez aussi les installer manuellement :
+    ```bash
+    pip install -r requirements.txt
+    ```
+    *(Note : Un fichier `requirements.txt` pourrait devoir être créé basé sur les imports du script s'il n'est pas déjà présent).*
+4.  **(Optionnel) Configurer la clé API OpenAI :** Créez un fichier `.env` dans le répertoire du projet et ajoutez votre clé API OpenAI :
+    ```env
+    OPENAI_API_KEY='votre_cle_api_ici'
+    ```
 
-### Démarrage
-```bash
-python ollama_chat_gui3.py
-```
+### Utilisation
 
-Le serveur Ollama sera démarré automatiquement si nécessaire.
-
-### Interactions
-- **Nouvelle conversation**: Cliquez sur "➕ Nouvelle conversation"
-- **Envoi de messages**: Tapez votre message puis cliquez sur "Envoyer" ou utilisez Ctrl+Entrée
-- **Changement de modèle**: Sélectionnez un modèle dans la liste déroulante en bas
-- **Favoris**: Clic-droit sur un modèle pour l'ajouter/retirer des favoris
-
-## Création d'un exécutable
-```bash
-pyinstaller --onefile --windowed --collect-all llama_cpp --collect-all PySide6 --name ChatLite ollama_chat_gui3.py
-```
-
-## Compatibilité des modèles
-- **Ollama**: Tous les modèles disponibles via API Ollama
-- **GGUF**: Modèles compatibles avec llama.cpp (ex: `llama2-7b-chat.gguf`, `gemma3:4b.gguf`)
-- **OpenAI**: Modèles GPT et autres modèles accessibles via l'API OpenAI
+1.  Exécutez le script Python :
+    ```bash
+    python ollama_chat_gui3.py
+    ```
+2.  L'application va démarrer. Si Ollama n'est pas en cours d'exécution, elle pourrait tenter de le démarrer (selon la configuration système).
+3.  Sélectionnez un modèle d'IA disponible dans la liste déroulante (modèles locaux récupérés depuis Ollama, modèles OpenAI si la clé API est configurée).
+4.  Commencez à discuter ! Utilisez le bouton "➕ Nouvelle conversation" pour créer de nouveaux chats.
+5.  Les conversations sont sauvegardées automatiquement.

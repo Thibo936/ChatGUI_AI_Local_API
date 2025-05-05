@@ -9,13 +9,14 @@ import json
 import re
 import time
 import uuid
+import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import psutil
 import requests
 import subprocess
-from llama_cpp import Llama
+import shutil
 from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QTextCursor, QTextOption, QDesktopServices
 from PySide6.QtWidgets import (
@@ -37,15 +38,41 @@ from PySide6.QtWidgets import (
 )
 
 import sys
+import platform
+import traceback
 
 if getattr(sys, 'frozen', False):
-    # Exécuté via PyInstaller
     BASE_DIR = Path(sys.executable).parent
 else:
     BASE_DIR = Path(__file__).parent
 
-MODEL_DIR = BASE_DIR / "models"
-MODEL_DIR.mkdir(exist_ok=True)
+# Remplacement pour utiliser AppData (chemin écrivable)
+#local_appdata = os.getenv("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")
+#DATA_DIR = Path(local_appdata) / "ChatGUI_AI_Local_API"
+#DATA_DIR.mkdir(parents=True, exist_ok=True)
+#MODEL_DIR = DATA_DIR / "models"
+#MODEL_DIR.mkdir(exist_ok=True)
+local_appdata = os.getenv("LOCALAPPDATA")
+DATA_DIR = Path(local_appdata) / "ChatGUI_AI_Local_API"
+MODEL_DIR = DATA_DIR / "models"
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ---------- CONFIGURATION DU LOGGING ----------
+log_dir = DATA_DIR
+log_file = log_dir / "chatgui.log"
+log_formatter = logging.Formatter("%(asctime)s %(levelname)-8s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+for handler in root_logger.handlers[:]:
+    root_logger.removeHandler(handler)
+file_handler = logging.FileHandler(str(log_file), encoding="utf-8")
+file_handler.setFormatter(log_formatter)
+root_logger.addHandler(file_handler)
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(log_formatter)
+root_logger.addHandler(stream_handler)
+logging.info("Démarrage de ChatGUI_AI_Local_API")
 
 # Mise à jour pour le nouveau SDK OpenAI
 from openai import OpenAI
@@ -53,21 +80,18 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = None
 if OPENAI_API_KEY:
     http_client = httpx.Client(trust_env=True)
-        
     client = OpenAI(
         api_key=OPENAI_API_KEY,
         http_client=http_client
     )
-    
     def list_openai_models():
         try:
             models = client.models.list()
             return [model.id for model in models.data 
                    if "gpt" in model.id.lower() or "o3" in model.id.lower()]
         except Exception as e:
-            print(f"Erreur lors de la récupération des modèles OpenAI: {e}")
+            logging.error(f"Erreur lors de la récupération des modèles OpenAI: {e}", exc_info=True)
             return []
-
     def chat_completion(model: str, messages: list[dict]):
         try:
             response = client.chat.completions.create(
@@ -76,7 +100,7 @@ if OPENAI_API_KEY:
             )
             return response
         except Exception as e:
-            print(f"Erreur lors de l'appel à OpenAI: {e}")
+            logging.error(f"Erreur lors de l'appel à OpenAI: {e}", exc_info=True)
             raise
 
 # ------------------------------- Config -------------------------------
@@ -125,12 +149,88 @@ def start_ollama_server():
     try:
         subprocess.Popen(["ollama", "serve"], creationflags=subprocess.CREATE_NEW_CONSOLE)
     except Exception as e:
+        logging.error(f"Impossible de lancer Ollama : {e}", exc_info=True)
         QMessageBox.critical(None, "Erreur Ollama", f"Impossible de lancer Ollama : {e}")
+
+def check_vc_redist():
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64")
+        value, _ = winreg.QueryValueEx(key, "Installed")
+        return value == 1
+    except Exception:
+        return False
+
+def check_python():
+    return shutil.which("python") is not None
+
+def check_dependencies():
+    missing = []
+    try:
+        import PySide6
+    except ImportError:
+        missing.append("PySide6")
+    try:
+        import requests
+    except ImportError:
+        missing.append("requests")
+    try:
+        import psutil
+    except ImportError:
+        missing.append("psutil")
+    try:
+        import rich
+    except ImportError:
+        missing.append("rich")
+    try:
+        import dotenv
+    except ImportError:
+        missing.append("python-dotenv")
+    try:
+        import openai
+    except ImportError:
+        missing.append("openai")
+    try:
+        import httpx
+    except ImportError:
+        missing.append("httpx")
+    return missing
+
+def prompt_install(title, message, installer_path=None, url=None):
+    app = QApplication.instance()
+    btn = QMessageBox.question(None, title, message, QMessageBox.Yes | QMessageBox.No)
+    if btn == QMessageBox.Yes:
+        if installer_path and os.path.exists(installer_path):
+            subprocess.Popen([installer_path], shell=True)
+        elif url:
+            import webbrowser
+            webbrowser.open(url)
+
+def log_critical_error(context: str, exc: Exception, extra: dict = None):
+    sys_info = {
+        "python_version": sys.version,
+        "platform": platform.platform(),
+        "release": platform.release(),
+        "machine": platform.machine(),
+        "processor": platform.processor(),
+        "cpu_count": psutil.cpu_count(logical=True),
+        "ram_total_gb": round(psutil.virtual_memory().total / (1024**3), 2),
+    }
+    if extra:
+        sys_info.update(extra)
+    logging.error(
+        f"{context}\n"
+        f"Exception: {exc}\n"
+        f"WinError: {getattr(exc, 'winerror', None)}, errno: {getattr(exc, 'errno', None)}\n"
+        f"Traceback:\n{traceback.format_exc()}\n"
+        f"System info: {json.dumps(sys_info, indent=2, ensure_ascii=False)}"
+    )
 
 # ---------------------------- Main window ----------------------------
 class ChatWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.ollama_available = True
         self.setWindowTitle("ChatGUI_AI_Local_API")
         self.resize(960, 640)
 
@@ -139,8 +239,6 @@ class ChatWindow(QMainWindow):
         self.conversations: dict[str, list[Message]] = {}
         self.current_conv_id: str | None = None
         self.reason_states: dict[str, bool] = {}
-        self.local_models: dict[str, Path] = {}     # nom -> chemin
-        self.llama_models: dict[str, Llama] = {}    # cache des instances
 
         self.fav_file = SAVE_DIR / "model_favorites.json"
         self.favorites = self._load_model_favorites()
@@ -286,31 +384,23 @@ class ChatWindow(QMainWindow):
         try:
             (self.fav_file).write_text(json.dumps(self.favorites, ensure_ascii=False, indent=2), encoding='utf-8')
         except Exception as e:
-            print(f"Erreur sauvegarde favoris : {e}")
-
-    def _scan_local_models(self) -> dict[str, Path]:
-        d: dict[str, Path] = {}
-        print("Scan du dossier models :", MODEL_DIR)
-        for f in MODEL_DIR.glob("*.gguf"):
-            print("Trouvé :", f)
-            d[f.stem] = f
-        return d
+            logging.error(f"Erreur sauvegarde favoris : {e}", exc_info=True)
 
     def _populate_model_box(self):
         self.favorites = self._load_model_favorites()
         models = []
-        try:
-            models = self.client.list_models()
-        except:
-            QMessageBox.warning(self, "Ollama", "Erreur liste modèles")
+        if self.ollama_available:
+            try:
+                models = self.client.list_models()
+            except Exception as e:
+                models = []
+                logging.error("Erreur lors de la récupération des modèles Ollama", exc_info=True)
         if OPENAI_API_KEY:
             try:
                 openai = list_openai_models()
                 models += [f"OpenAI: {m}" for m in openai]
             except:
                 pass
-        self.local_models = self._scan_local_models()
-        models += [f"Local: {name}" for name in self.local_models]
         models = list(dict.fromkeys(models))
         favs = [m for m in self.favorites if m in models]
         oth = sorted([m for m in models if m not in self.favorites])
@@ -357,7 +447,7 @@ class ChatWindow(QMainWindow):
         self.msg_edit.setFixedHeight(min(int(h), 150))
 
     def _key_press_override(self, e):
-        if e.key() in (Qt.Key_Return, Qt.Key_Enter) and e.modifiers() & Qt.ControlModifier:
+        if e.key() in (Qt.Key_Return, Qt.Key_Enter) and not (e.modifiers() & Qt.ShiftModifier):
             self.send_message()
         else:
             QTextEdit.keyPressEvent(self.msg_edit, e)
@@ -405,24 +495,6 @@ class ChatWindow(QMainWindow):
                 resp = resp_obj.choices[0].message.content
                 total_tokens = resp_obj.usage.total_tokens
                 tok_s = total_tokens / duration
-            elif self.current_model and self.current_model.startswith("Local: "):
-                name = self.current_model[len("Local: "):]
-                path = self.local_models.get(name)
-                if not path:
-                    raise RuntimeError(f"Modèle local introuvable : {name}")
-                llm = self.llama_models.get(name)
-                if not llm:
-                    llm = Llama(model_path=str(path))
-                    self.llama_models[name] = llm
-                prompt = "\n".join(f"{m.role}: {m.content}" for m in self.conversations[self.current_conv_id])
-                start = time.time()
-                output = ""
-                for chunk in llm(prompt, max_tokens=512, stop=["user:", "assistant:"], stream=True):
-                    output += chunk["choices"][0]["text"]
-                resp = output
-                duration = max(time.time() - start, 1e-6)
-                total_tokens = len(resp.split())  # estimation grossière des tokens
-                tok_s = total_tokens / duration if total_tokens else 0.0
             else:
                 resp, total_tokens, tok_s = self.client.chat(self.current_model, payload)
 
@@ -431,6 +503,7 @@ class ChatWindow(QMainWindow):
             self.render_conversation()
             self._save()
         except Exception as err:
+            log_critical_error("Erreur lors de l'envoi du message", err)
             QMessageBox.critical(self, "Erreur", str(err))
 
     def _format_assistant(self, txt: str) -> str:
@@ -499,7 +572,7 @@ class ChatWindow(QMainWindow):
                 self.reason_states[rid] = not self.reason_states.get(rid, False)
                 self.render_conversation()
             else:
-                print(f"Warning: Could not extract reason ID from URL: {url.toString()}")
+                logging.warning(f"Could not extract reason ID from URL: {url.toString()}")
         elif scheme in ["http", "https"]:
             QDesktopServices.openUrl(url)
 
@@ -511,14 +584,13 @@ class ChatWindow(QMainWindow):
             conv_data = [asdict(m) for m in self.conversations.get(self.current_conv_id, [])]
             path.write_text(json.dumps(conv_data, ensure_ascii=False, indent=2), encoding='utf-8')
         except Exception as e:
-            print(f"Error saving conversation {self.current_conv_id}: {e}")
+            logging.error(f"Error saving conversation {self.current_conv_id}: {e}", exc_info=True)
 
     def load_conversations(self):
         self.conversations = {}
         self.conv_list.clear()
         loaded_items = []
         for file_path in SAVE_DIR.glob("*.json"):
-            # Ignorer le fichier des favoris
             if file_path.name == "model_favorites.json":
                 continue
             try:
@@ -538,7 +610,7 @@ class ChatWindow(QMainWindow):
                 item.setData(Qt.UserRole, cid)
                 loaded_items.append(item)
             except Exception as e:
-                print(f"Error loading conversation {file_path.name}: {e}")
+                logging.error(f"Error loading conversation {file_path.name}: {e}", exc_info=True)
 
         loaded_items.sort(key=lambda x: x.text())
         for item in loaded_items:
@@ -579,16 +651,27 @@ class ChatWindow(QMainWindow):
 
 # ============================== run ================================
 if __name__ == "__main__":
-    if not is_ollama_running():
-        start_ollama_server()
-        import time
-        for _ in range(10):
-            if is_ollama_running():
-                break
-            time.sleep(1)
-        else:
-            QMessageBox.critical(None, "Erreur Ollama", "Impossible de démarrer le serveur Ollama.")
+    import sys
+    from PySide6.QtWidgets import QApplication
+
     app = QApplication([])
+
+    if os.name == "nt":
+        if not check_vc_redist():
+            prompt_install(
+                "VC++ Runtime manquant",
+                "Le runtime VC++ 2022 n'est pas installé. Voulez-vous lancer le téléchargement ?",
+                url="https://aka.ms/vs/17/release/vc_redist.x64.exe"
+            )
+
+    missing = check_dependencies()
+    if missing:
+        prompt_install(
+            "Dépendances manquantes",
+            "Certaines dépendances Python sont absentes :\n- " + "\n- ".join(missing) + "\nVoulez-vous tenter une installation automatique ?",
+        )
+        subprocess.call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+
     win = ChatWindow()
     win.show()
     app.exec()
