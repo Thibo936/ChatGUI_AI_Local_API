@@ -1,123 +1,168 @@
-# ChatGUI_AI_Local_API
+# ChatGUI\_AI\_Local\_API
 
-## English
-
-### Description
-
-ChatGUI_AI_Local_API is a graphical user interface (GUI) application that allows you to chat with various AI models. It supports both local models via Ollama and cloud-based models via the OpenAI API. The application provides a simple interface to manage multiple conversations, select different AI models, and monitor resource usage.
-
-### Features
-
-*   **Multi-Model Support:** Interact with local models (via Ollama) and OpenAI models (GPT series).
-*   **Conversation Management:** Create, switch between, and delete multiple chat conversations.
-*   **Local Storage:** Conversations are saved locally in JSON format.
-*   **Model Favorites:** Mark preferred models as favorites for quick access.
-*   **Resource Monitoring:** Displays CPU and RAM usage.
-*   **Markdown Rendering:** Basic Markdown support for assistant messages (bold, italics, code blocks).
-*   **Dependency Checks:** Checks for necessary dependencies like VC++ Runtime and Python packages on startup.
-*   **Cross-Platform:** Built with PySide6, aiming for cross-platform compatibility (primarily tested on Windows).
-
-### Requirements
-
-*   Python 3.x
-*   Ollama (for local models): [https://ollama.com/](https://ollama.com/)
-*   Required Python packages (see `requirements.txt` - installation attempted automatically):
-    *   `PySide6`
-    *   `requests`
-    *   `psutil`
-    *   `python-dotenv`
-    *   `openai`
-    *   `httpx`
-*   (Windows) Microsoft Visual C++ Redistributable for Visual Studio 2015-2022 (x64). Installation prompted if missing.
-*   (Optional) OpenAI API Key for using OpenAI models.
-
-### Installation
-
-1.  **Clone the repository:**
-    ```bash
-    git clone <repository_url>
-    cd ChatGUI_AI_Local_API
-    ```
-2.  **Install Ollama:** Download and install Ollama from [https://ollama.com/](https://ollama.com/). Ensure the Ollama server is running.
-3.  **Install Python dependencies:** The application attempts to install missing dependencies automatically. You can also install them manually:
-    ```bash
-    pip install -r requirements.txt
-    ```
-    *(Note: A `requirements.txt` file might need to be created based on the imports in the script if not already present).*
-4.  **(Optional) Set up OpenAI API Key:** Create a `.env` file in the project directory and add your OpenAI API key:
-    ```env
-    OPENAI_API_KEY='your_api_key_here'
-    ```
-
-### Usage
-
-1.  Run the Python script:
-    ```bash
-    python ollama_chat_gui3.py
-    ```
-2.  The application will start. If Ollama is not running, it might attempt to start it (depending on system configuration).
-3.  Select an available AI model from the dropdown list (local models fetched from Ollama, OpenAI models if the API key is configured).
-4.  Start chatting! Use the "➕ Nouvelle conversation" button to create new chats.
-5.  Conversations are saved automatically.
+> **English 🇬🇧 | Français 🇫🇷**
+> A simple bilingual README for a simple local AI chat GUI.
 
 ---
 
-## Français
+## English 🇬🇧
 
-### Description
+### Overview
 
-ChatGUI_AI_Local_API est une application d'interface graphique (GUI) qui vous permet de discuter avec divers modèles d'IA. Elle prend en charge à la fois les modèles locaux via Ollama et les modèles basés sur le cloud via l'API OpenAI. L'application fournit une interface simple pour gérer plusieurs conversations, sélectionner différents modèles d'IA et surveiller l'utilisation des ressources.
+**ChatGUI\_AI\_Local\_API** is a lightweight desktop application written in Python + PySide6 that lets you chat with:
 
-### Fonctionnalités
+* **Local models** served by **[Ollama](https://ollama.com/)** (`localhost:11434`)
+* **OpenAI models** (when `OPENAI_API_KEY` is defined)
 
-*   **Support Multi-Modèles :** Interagissez avec des modèles locaux (via Ollama) et des modèles OpenAI (série GPT).
-*   **Gestion des Conversations :** Créez, basculez entre et supprimez plusieurs conversations de chat.
-*   **Stockage Local :** Les conversations sont sauvegardées localement au format JSON.
-*   **Modèles Favoris :** Marquez les modèles préférés comme favoris pour un accès rapide.
-*   **Surveillance des Ressources :** Affiche l'utilisation du CPU et de la RAM.
-*   **Rendu Markdown :** Prise en charge basique du Markdown pour les messages de l'assistant (gras, italique, blocs de code).
-*   **Vérification des Dépendances :** Vérifie les dépendances nécessaires comme le Runtime VC++ et les paquets Python au démarrage.
-*   **Multiplateforme :** Construit avec PySide6, visant la compatibilité multiplateforme (principalement testé sous Windows).
+It ships with a clean GUI that supports multiple conversations, model favourites, visible chain‑of‑thought, and real‑time resource usage.
 
-### Prérequis
+### Key features
 
-*   Python 3.x
-*   Ollama (pour les modèles locaux) : [https://ollama.com/](https://ollama.com/)
-*   Paquets Python requis (voir `requirements.txt` - installation tentée automatiquement) :
-    *   `PySide6`
-    *   `requests`
-    *   `psutil`
-    *   `python-dotenv`
-    *   `openai`
-    *   `httpx`
-*   (Windows) Microsoft Visual C++ Redistributable pour Visual Studio 2015-2022 (x64). L'installation est proposée si manquant.
-*   (Optionnel) Clé API OpenAI pour utiliser les modèles OpenAI.
+* Multi‑conversation sidebar with auto‑save to `%APPDATA%/OllamaChats`
+* Toggle assistant chain‑of‑thought (`<think>…</think>`) with a single click
+* Model favourites ⭐ and instant switch
+* Token statistics (total & tok/s) + CPU/RAM monitor
+* Automatic checks for missing Python deps & VC++ runtime on Windows
+
+### Prerequisites
+
+| Requirement      | Notes                                                        |
+| ---------------- | ------------------------------------------------------------ |
+| Python **3.10+** | Windows / macOS / Linux                                      |
+| **Ollama**       | Needed only for local models – must run on `localhost:11434` |
+| `OPENAI_API_KEY` | Optional – enables OpenAI models                             |
 
 ### Installation
 
-1.  **Cloner le dépôt :**
-    ```bash
-    git clone <url_du_depot>
-    cd ChatGUI_AI_Local_API
-    ```
-2.  **Installer Ollama :** Téléchargez et installez Ollama depuis [https://ollama.com/](https://ollama.com/). Assurez-vous que le serveur Ollama est en cours d'exécution.
-3.  **Installer les dépendances Python :** L'application tente d'installer automatiquement les dépendances manquantes. Vous pouvez aussi les installer manuellement :
-    ```bash
-    pip install -r requirements.txt
-    ```
-    *(Note : Un fichier `requirements.txt` pourrait devoir être créé basé sur les imports du script s'il n'est pas déjà présent).*
-4.  **(Optionnel) Configurer la clé API OpenAI :** Créez un fichier `.env` dans le répertoire du projet et ajoutez votre clé API OpenAI :
-    ```env
-    OPENAI_API_KEY='votre_cle_api_ici'
-    ```
+```bash
+# 1. Clone
+$ git clone https://github.com/your‑name/ChatGUI_AI_Local_API.git
+$ cd ChatGUI_AI_Local_API
 
-### Utilisation
+# 2. Create venv (recommended)
+$ python -m venv .venv
+$ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 
-1.  Exécutez le script Python :
-    ```bash
-    python ollama_chat_gui3.py
-    ```
-2.  L'application va démarrer. Si Ollama n'est pas en cours d'exécution, elle pourrait tenter de le démarrer (selon la configuration système).
-3.  Sélectionnez un modèle d'IA disponible dans la liste déroulante (modèles locaux récupérés depuis Ollama, modèles OpenAI si la clé API est configurée).
-4.  Commencez à discuter ! Utilisez le bouton "➕ Nouvelle conversation" pour créer de nouveaux chats.
-5.  Les conversations sont sauvegardées automatiquement.
+# 3. Install deps
+$ pip install -r requirements.txt
+```
+
+### Running
+
+```bash
+python ollama_chat_gui3.py
+```
+
+On first launch the app proposes to install missing Python packages, VC++ redistributable, or start **Ollama** if it is not detected.
+
+### Environment variables
+
+* `OPENAI_API_KEY` – OpenAI key (optional)
+* `LOCALAPPDATA`  – Overrides default data directory on Windows
+
+### File structure
+
+```
+ollama_chat_gui3.py        # Main application
+requirements.txt          # Dependencies
+%APPDATA%/OllamaChats/    # Auto‑saved chats & settings
+  ├── model_favorites.json
+  └── <uuid>.json         # One file per conversation
+```
+
+### Packaging (Windows)
+
+```bash
+pip install pyinstaller
+pyinstaller --onefile --noconsole ollama_chat_gui3.py
+```
+
+### Contributing
+
+Pull requests and issues are welcome!
+
+### License
+
+MIT
+
+---
+
+## Français 🇫🇷
+
+### Aperçu
+
+**ChatGUI\_AI\_Local\_API** est une application de bureau légère (Python + PySide6) qui permet de discuter :
+
+* avec des **modèles locaux** servis par **[Ollama](https://ollama.com/)** (`localhost:11434`)
+* avec des **modèles OpenAI** (si la variable `OPENAI_API_KEY` est définie)
+
+Elle propose une interface soignée, la gestion de plusieurs conversations, des modèles favoris, l’affichage des pensées de l’IA et la surveillance des ressources système.
+
+### Fonctionnalités clés
+
+* Barre latérale multi‑conversations avec sauvegarde automatique dans `%APPDATA%/OllamaChats`
+* Affichage/masquage des pensées de l’IA (`<think>…</think>`) en un clic
+* Favoris de modèles ⭐ et changement instantané
+* Statistiques de tokens (total & tok/s) + moniteur CPU/RAM en temps réel
+* Vérifications automatiques des dépendances Python et du runtime VC++ sous Windows
+
+### Prérequis
+
+| Pré‑requis       | Notes                                                                              |
+| ---------------- | ---------------------------------------------------------------------------------- |
+| Python **3.10+** | Windows / macOS / Linux                                                            |
+| **Ollama**       | Nécessaire uniquement pour les modèles locaux – doit tourner sur `localhost:11434` |
+| `OPENAI_API_KEY` | Optionnel – active les modèles OpenAI                                              |
+
+### Installation
+
+```bash
+# 1. Cloner le dépôt
+$ git clone https://github.com/votre‑pseudo/ChatGUI_AI_Local_API.git
+$ cd ChatGUI_AI_Local_API
+
+# 2. Créer un virtualenv (recommandé)
+$ python -m venv .venv
+$ source .venv/bin/activate   # Windows : .venv\Scripts\activate
+
+# 3. Installer les dépendances
+$ pip install -r requirements.txt
+```
+
+### Lancement
+
+```bash
+python ollama_chat_gui3.py
+```
+
+Au premier démarrage, l’application propose d’installer les paquets Python manquants, le runtime VC++ ou de lancer **Ollama** s’il n’est pas détecté.
+
+### Variables d’environnement
+
+* `OPENAI_API_KEY` – Clé OpenAI (optionnel)
+* `LOCALAPPDATA`  – Redéfinit le répertoire de données sous Windows
+
+### Arborescence
+
+```
+ollama_chat_gui3.py        # Application principale
+requirements.txt          # Dépendances
+%APPDATA%/OllamaChats/    # Conversations et paramètres sauvegardés
+  ├── model_favorites.json
+  └── <uuid>.json         # Une conversation par fichier
+```
+
+### Création d’un exécutable Windows
+
+```bash
+pip install pyinstaller
+pyinstaller --onefile --noconsole ollama_chat_gui3.py
+```
+
+### Contribuer
+
+Les pull requests et issues sont les bienvenus !
+
+### Licence
+
+MIT
