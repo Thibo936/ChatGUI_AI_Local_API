@@ -1,9 +1,7 @@
-llama-cpp-python
-py-cpuinfo
-PySide6
-openai
-python-dotenv
-httpx
-psutil
-requests
-rich
+PySide6>=6.5.0
+requests>=2.31.0
+psutil>=5.9.0
+rich>=13.0.0
+python-dotenv>=1.0.0
+openai>=1.0.0
+httpx>=0.24.0

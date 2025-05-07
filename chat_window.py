@@ -1,31 +1,22 @@
-from __future__ import annotations
-
 import os
-import dotenv
-dotenv.load_dotenv()
-import httpx
-import html
 import json
 import re
 import time
 import uuid
+import html
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from pathlib import Path
 
 import psutil
-import requests
-import subprocess
-import shutil
 from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QTextCursor, QTextOption, QDesktopServices
 from PySide6.QtWidgets import (
-    QApplication,
+    QMainWindow,
     QComboBox,
     QLabel,
     QListWidget,
     QListWidgetItem,
-    QMainWindow,
     QMessageBox,
     QPushButton,
     QSplitter,
@@ -37,203 +28,38 @@ from PySide6.QtWidgets import (
     QMenu,
 )
 
-import sys
-import platform
-import traceback
+from config import SAVE_DIR
+from models import Message
+from ollama_client import OllamaClient, is_ollama_running, start_ollama_server
+from utils import log_critical_error
 
-if getattr(sys, 'frozen', False):
-    BASE_DIR = Path(sys.executable).parent
-else:
-    BASE_DIR = Path(__file__).parent
-
-local_appdata = os.getenv("LOCALAPPDATA")
-DATA_DIR = Path(local_appdata) / "ChatGUI_AI_Local_API"
-#DATA_DIR = Path(local_appdata) / "ChatGUI_AI_Local_API"
-#DATA_DIR.mkdir(parents=True, exist_ok=True)
-#MODEL_DIR = DATA_DIR / "models"
-#MODEL_DIR.mkdir(exist_ok=True)
-local_appdata = os.getenv("LOCALAPPDATA")
-DATA_DIR = Path(local_appdata) / "ChatGUI_AI_Local_API"
-MODEL_DIR = DATA_DIR / "models"
-MODEL_DIR.mkdir(parents=True, exist_ok=True)
-
-
-# ---------- CONFIGURATION DU LOGGING ----------
-log_dir = DATA_DIR
-log_file = log_dir / "chatgui.log"
-log_formatter = logging.Formatter("%(asctime)s %(levelname)-8s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-root_logger = logging.getLogger()
-root_logger.setLevel(logging.INFO)
-for handler in root_logger.handlers[:]:
-    root_logger.removeHandler(handler)
-file_handler = logging.FileHandler(str(log_file), encoding="utf-8")
-file_handler.setFormatter(log_formatter)
-root_logger.addHandler(file_handler)
-stream_handler = logging.StreamHandler()
-stream_handler.setFormatter(log_formatter)
-root_logger.addHandler(stream_handler)
-logging.info("Démarrage de ChatGUI_AI_Local_API")
-
-# Mise à jour pour le nouveau SDK OpenAI
-from openai import OpenAI
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-client = None
-if OPENAI_API_KEY:
-    http_client = httpx.Client(trust_env=True)
-    client = OpenAI(
-        api_key=OPENAI_API_KEY,
-        http_client=http_client
-    )
-    def list_openai_models():
-        try:
-            models = client.models.list()
-            return [model.id for model in models.data 
-                   if "gpt" in model.id.lower() or "o3" in model.id.lower()]
-        except Exception as e:
-            logging.error(f"Erreur lors de la récupération des modèles OpenAI: {e}", exc_info=True)
-            return []
-    def chat_completion(model: str, messages: list[dict]):
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-            )
-            return response
-        except Exception as e:
-            logging.error(f"Erreur lors de l'appel à OpenAI: {e}", exc_info=True)
-            raise
-
-# ------------------------------- Config -------------------------------
-OLLAMA_URL = "http://localhost:11434"
-SAVE_DIR = Path(os.getenv("APPDATA", ".")) / "OllamaChats"
-SAVE_DIR.mkdir(exist_ok=True)
 THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
 
-# ------------------------------- Data -------------------------------
-@dataclass
-class Message:
-    role: str  # "user" | "assistant"
-    content: str
-    tokens: int = 0
-    tok_s: float = 0.0
-    model: str = ""
+# Modèles par défaut si aucun n'est disponible
+DEFAULT_MODELS = ["llama2", "mistral", "phi2", "gemma:2b"]
 
-# --------------------------- Ollama client ---------------------------
-class OllamaClient:
-    def __init__(self, base_url: str = OLLAMA_URL):
-        self.base = base_url.rstrip("/")
-
-    def list_models(self) -> list[str]:
-        r = requests.get(f"{self.base}/api/tags")
-        r.raise_for_status()
-        return [m["name"] for m in r.json()["models"]]
-
-    def chat(self, model: str, messages: list[dict]) -> tuple[str, int, float]:
-        payload = {"model": model, "messages": messages, "stream": False}
-        start = time.time()
-        r = requests.post(f"{self.base}/api/chat", json=payload, timeout=300)
-        r.raise_for_status()
-        duration = max(time.time() - start, 1e-6)
-        data = r.json()
-        total_tokens = data.get("usage", {}).get("total_tokens", 0)
-        return data["message"]["content"], total_tokens, total_tokens / duration
-
-# --------------------------- Ollama server ---------------------------
-def is_ollama_running() -> bool:
-    try:
-        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=2)
-        return r.status_code == 200
-    except Exception:
-        return False
-
-def start_ollama_server():
-    try:
-        subprocess.Popen(["ollama", "serve"], creationflags=subprocess.CREATE_NEW_CONSOLE)
-    except Exception as e:
-        logging.error(f"Impossible de lancer Ollama : {e}", exc_info=True)
-        QMessageBox.critical(None, "Erreur Ollama", f"Impossible de lancer Ollama : {e}")
-
-def check_vc_redist():
-    try:
-        import winreg
-        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64")
-        value, _ = winreg.QueryValueEx(key, "Installed")
-        return value == 1
-    except Exception:
-        return False
-
-def check_python():
-    return shutil.which("python") is not None
-
-def check_dependencies():
-    missing = []
-    try:
-        import PySide6
-    except ImportError:
-        missing.append("PySide6")
-    try:
-        import requests
-    except ImportError:
-        missing.append("requests")
-    try:
-        import psutil
-    except ImportError:
-        missing.append("psutil")
-    try:
-        import rich
-    except ImportError:
-        missing.append("rich")
-    try:
-        import dotenv
-    except ImportError:
-        missing.append("python-dotenv")
-    try:
-        import openai
-    except ImportError:
-        missing.append("openai")
-    try:
-        import httpx
-    except ImportError:
-        missing.append("httpx")
-    return missing
-
-def prompt_install(title, message, installer_path=None, url=None):
-    app = QApplication.instance()
-    btn = QMessageBox.question(None, title, message, QMessageBox.Yes | QMessageBox.No)
-    if btn == QMessageBox.Yes:
-        if installer_path and os.path.exists(installer_path):
-            subprocess.Popen([installer_path], shell=True)
-        elif url:
-            import webbrowser
-            webbrowser.open(url)
-
-def log_critical_error(context: str, exc: Exception, extra: dict = None):
-    sys_info = {
-        "python_version": sys.version,
-        "platform": platform.platform(),
-        "release": platform.release(),
-        "machine": platform.machine(),
-        "processor": platform.processor(),
-        "cpu_count": psutil.cpu_count(logical=True),
-        "ram_total_gb": round(psutil.virtual_memory().total / (1024**3), 2),
-    }
-    if extra:
-        sys_info.update(extra)
-    logging.error(
-        f"{context}\n"
-        f"Exception: {exc}\n"
-        f"WinError: {getattr(exc, 'winerror', None)}, errno: {getattr(exc, 'errno', None)}\n"
-        f"Traceback:\n{traceback.format_exc()}\n"
-        f"System info: {json.dumps(sys_info, indent=2, ensure_ascii=False)}"
-    )
-
-# ---------------------------- Main window ----------------------------
 class ChatWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.ollama_available = True
+        self.ollama_available = is_ollama_running()
         self.setWindowTitle("ChatGUI_AI_Local_API")
         self.resize(960, 640)
+
+        if not self.ollama_available:
+            reply = QMessageBox.question(
+                self,
+                "Ollama non disponible",
+                "Ollama n'est pas en cours d'exécution. Voulez-vous le démarrer?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                start_ollama_server()
+                # Attendre que le serveur démarre
+                for _ in range(5):  # Essayer 5 fois
+                    time.sleep(1)
+                    if is_ollama_running():
+                        self.ollama_available = True
+                        break
 
         self.client = OllamaClient()
         self.current_model: str | None = None
@@ -244,27 +70,78 @@ class ChatWindow(QMainWindow):
         self.fav_file = SAVE_DIR / "model_favorites.json"
         self.favorites = self._load_model_favorites()
 
+        self._setup_ui()
+        self._setup_connections()
+        self._start_stats_timer()
+
+        # Remplir la liste des modèles
+        self._populate_model_box()
+        
+        # Sélectionner un modèle s'il y en a
+        if self.model_box.count() > 0:
+            self.change_model(self.model_box.currentText())
+        
+        self.load_conversations()
+        if not self.conversations:
+            self.new_conversation()
+        else:
+            first_cid = list(self.conversations.keys())[0]
+            for i in range(self.conv_list.count()):
+                item = self.conv_list.item(i)
+                if item.data(Qt.UserRole) == first_cid:
+                    self.conv_list.setCurrentItem(item)
+                    self.switch_conversation(item)
+                    break
+
+    def _setup_ui(self):
+        # Création des widgets
         self.new_conv_btn = QPushButton("➕ Nouvelle conversation")
-        self.new_conv_btn.clicked.connect(self.new_conversation)
         self.conv_list = QListWidget()
-        self.conv_list.itemClicked.connect(self.switch_conversation)
+        self.chat_view = QTextBrowser()
+        self.msg_edit = QTextEdit()
+        self.send_btn = QPushButton("Envoyer (Ctrl+Enter)")
+        self.model_box = QComboBox()
+        self.stats_label = QLabel("Tokens: 0 – 0 tok/s")
+        self.res_label = QLabel("CPU: 0%  RAM: 0%")
 
-        self.conv_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.conv_list.customContextMenuRequested.connect(self._show_conv_context_menu)
-        self.del_conv_action = QAction("Supprimer conversation", self)
-        self.del_conv_action.triggered.connect(self.delete_conversation)
+        # Configuration des widgets
+        self.chat_view.setOpenExternalLinks(False)
+        self.chat_view.setOpenLinks(False)
+        self.chat_view.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+        self.msg_edit.setMaximumHeight(150)
+        self.model_box.setContextMenuPolicy(Qt.CustomContextMenu)
 
+        # Mise en page
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.addWidget(self.new_conv_btn)
         left_layout.addWidget(self.conv_list, 1)
 
-        self.chat_view = QTextBrowser()
-        self.chat_view.setOpenExternalLinks(False)
-        self.chat_view.setOpenLinks(False)
-        self.chat_view.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
-        self.chat_view.anchorClicked.connect(self._anchor_clicked)
+        editor_bar = QHBoxLayout()
+        editor_bar.addWidget(self.msg_edit, 1)
+        editor_bar.addWidget(self.send_btn)
+
+        bottom_bar = QHBoxLayout()
+        bottom_bar.addWidget(self.model_box)
+        bottom_bar.addWidget(self.stats_label)
+        bottom_bar.addStretch(1)
+        bottom_bar.addWidget(self.res_label)
+
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(5, 5, 5, 5)
+        right_layout.addWidget(self.chat_view, 1)
+        right_layout.addLayout(editor_bar)
+        right_layout.addLayout(bottom_bar)
+
+        splitter = QSplitter()
+        splitter.addWidget(left_widget)
+        splitter.addWidget(right_widget)
+        splitter.setStretchFactor(1, 4)
+        self.setCentralWidget(splitter)
+
+        # Style CSS
         self.chat_view.document().setDefaultStyleSheet("""
             body { font-family: sans-serif; line-height: 1.4; }
             .message-container { margin-bottom: 10px; }
@@ -308,61 +185,19 @@ class ChatWindow(QMainWindow):
             hr { border: 0; height: 1px; background-color: #ddd; margin: 15px 0; }
         """)
 
-        self.msg_edit = QTextEdit()
+    def _setup_connections(self):
+        self.new_conv_btn.clicked.connect(self.new_conversation)
+        self.conv_list.itemClicked.connect(self.switch_conversation)
+        self.conv_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.conv_list.customContextMenuRequested.connect(self._show_conv_context_menu)
+        self.del_conv_action = QAction("Supprimer conversation", self)
+        self.del_conv_action.triggered.connect(self.delete_conversation)
         self.msg_edit.textChanged.connect(self._auto_resize)
-        self.msg_edit.setMaximumHeight(150)
-
-        self.send_btn = QPushButton("Envoyer (Ctrl+Enter)")
         self.send_btn.clicked.connect(self.send_message)
-
-        self.model_box = QComboBox()
-        self.model_box.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.model_box.customContextMenuRequested.connect(self._show_model_context_menu)
-
-        self._populate_model_box()
         self.model_box.currentTextChanged.connect(self.change_model)
-
-        self.stats_label = QLabel("Tokens: 0 – 0 tok/s")
-        self.res_label = QLabel("CPU: 0%  RAM: 0%")
-
-        editor_bar = QHBoxLayout()
-        editor_bar.addWidget(self.msg_edit, 1)
-        editor_bar.addWidget(self.send_btn)
-
-        bottom_bar = QHBoxLayout()
-        bottom_bar.addWidget(self.model_box)
-        bottom_bar.addWidget(self.stats_label)
-        bottom_bar.addStretch(1)
-        bottom_bar.addWidget(self.res_label)
-
-        right_widget = QWidget()
-        right_layout = QVBoxLayout(right_widget)
-        right_layout.setContentsMargins(5, 5, 5, 5)
-        right_layout.addWidget(self.chat_view, 1)
-        right_layout.addLayout(editor_bar)
-        right_layout.addLayout(bottom_bar)
-
-        splitter = QSplitter()
-        splitter.addWidget(left_widget)
-        splitter.addWidget(right_widget)
-        splitter.setStretchFactor(1, 4)
-        self.setCentralWidget(splitter)
-
+        self.model_box.customContextMenuRequested.connect(self._show_model_context_menu)
+        self.chat_view.anchorClicked.connect(self._anchor_clicked)
         self.msg_edit.keyPressEvent = self._key_press_override
-        QTimer.singleShot(0, self._start_stats_timer)
-
-        self.change_model(self.model_box.currentText())
-        self.load_conversations()
-        if not self.conversations:
-            self.new_conversation()
-        else:
-            first_cid = list(self.conversations.keys())[0]
-            for i in range(self.conv_list.count()):
-                item = self.conv_list.item(i)
-                if item.data(Qt.UserRole) == first_cid:
-                    self.conv_list.setCurrentItem(item)
-                    self.switch_conversation(item)
-                    break
 
     def _start_stats_timer(self):
         self.stats_timer = QTimer(self)
@@ -385,36 +220,89 @@ class ChatWindow(QMainWindow):
         try:
             (self.fav_file).write_text(json.dumps(self.favorites, ensure_ascii=False, indent=2), encoding='utf-8')
         except Exception as e:
-            logging.error(f"Erreur sauvegarde favoris : {e}", exc_info=True)
+            logging.error(f"Erreur sauvegarde favoris : {e}", exc_info=True)
 
     def _populate_model_box(self):
         self.favorites = self._load_model_favorites()
         models = []
+        
+        # Vérifier si Ollama est disponible
+        if not is_ollama_running():
+            self.ollama_available = False
+            logging.warning("Ollama n'est pas en cours d'exécution")
+        else:
+            self.ollama_available = True
+            
         if self.ollama_available:
             try:
                 models = self.client.list_models()
+                logging.info(f"Modèles Ollama récupérés: {models}")
             except Exception as e:
                 models = []
-                logging.error("Erreur lors de la récupération des modèles Ollama", exc_info=True)
-        if OPENAI_API_KEY:
+                logging.error(f"Erreur lors de la récupération des modèles Ollama: {e}", exc_info=True)
+                
+        # Si aucun modèle n'a été récupéré, ajouter les modèles par défaut
+        if not models and self.ollama_available:
+            models = DEFAULT_MODELS
+            logging.info(f"Utilisation des modèles par défaut: {models}")
+                
+        # Essayer de récupérer les modèles OpenAI
+        api_key = os.getenv("OPENAI_API_KEY")
+        if api_key:
             try:
-                openai = list_openai_models()
-                models += [f"OpenAI: {m}" for m in openai]
-            except:
-                pass
+                from openai import OpenAI
+                
+                # Créer un client avec l'API key
+                client = OpenAI(api_key=api_key)
+                
+                # Récupérer la liste des modèles
+                response = client.models.list()
+                
+                # Filtrer les modèles pour ne garder que ceux qui contiennent "gpt" ou "o3"
+                openai_models = [model.id for model in response.data 
+                               if "gpt" in model.id.lower() or "o3" in model.id.lower()]
+                               
+                if openai_models:
+                    logging.info(f"Modèles OpenAI récupérés: {openai_models}")
+                    models += [f"OpenAI: {m}" for m in openai_models]
+                else:
+                    logging.warning("Aucun modèle OpenAI correspondant trouvé")
+            except Exception as e:
+                logging.error(f"Erreur lors de la récupération des modèles OpenAI: {e}", exc_info=True)
+                
+        # Si toujours aucun modèle disponible, afficher un message
+        if not models:
+            QMessageBox.warning(
+                self,
+                "Aucun modèle disponible",
+                "Aucun modèle n'a été trouvé. Assurez-vous qu'Ollama est en cours d'exécution ou que votre clé API OpenAI est valide."
+            )
+            # Ajouter un modèle factice pour éviter les erreurs
+            models = ["Aucun modèle disponible"]
+            
+        # Dédupliquer et trier les modèles
         models = list(dict.fromkeys(models))
         favs = [m for m in self.favorites if m in models]
         oth = sorted([m for m in models if m not in self.favorites])
+        
+        # Sauvegarder le modèle courant
         prev = self.current_model
+        
+        # Remplir la combobox
         self.model_box.clear()
         for m in favs:
             self.model_box.addItem(f"★ {m}", m)
         for m in oth:
             self.model_box.addItem(m, m)
+            
+        # Restaurer le modèle précédent s'il existe encore
         if prev:
             i = self.model_box.findData(prev)
             if i >= 0:
                 self.model_box.setCurrentIndex(i)
+        elif self.model_box.count() > 0:
+            # Sélectionner le premier modèle par défaut
+            self.model_box.setCurrentIndex(0)
 
     def _show_model_context_menu(self, pos):
         idx = self.model_box.currentIndex()
@@ -490,8 +378,13 @@ class ChatWindow(QMainWindow):
         try:
             if self.current_model and self.current_model.startswith("OpenAI: "):
                 model_name = self.current_model[len("OpenAI: "):]
+                from openai import OpenAI
+                client = OpenAI()
                 start = time.time()
-                resp_obj = chat_completion(model=model_name, messages=payload)
+                resp_obj = client.chat.completions.create(
+                    model=model_name,
+                    messages=payload,
+                )
                 duration = max(time.time() - start, 1e-6)
                 resp = resp_obj.choices[0].message.content
                 total_tokens = resp_obj.usage.total_tokens
@@ -550,7 +443,6 @@ class ChatWindow(QMainWindow):
             if m.role == "user":
                 role_text = "Vous"
             else:
-                # Affiche le nom du modèle utilisé pour ce message IA
                 model_name = m.model if getattr(m, "model", None) else "IA"
                 role_text = f"IA ({model_name})"
 
@@ -655,30 +547,3 @@ class ChatWindow(QMainWindow):
                     self.switch_conversation(self.conv_list.currentItem())
                 else:
                     self.new_conversation()
-
-# ============================== run ================================
-if __name__ == "__main__":
-    import sys
-    from PySide6.QtWidgets import QApplication
-
-    app = QApplication([])
-
-    if os.name == "nt":
-        if not check_vc_redist():
-            prompt_install(
-                "VC++ Runtime manquant",
-                "Le runtime VC++ 2022 n'est pas installé. Voulez-vous lancer le téléchargement ?",
-                url="https://aka.ms/vs/17/release/vc_redist.x64.exe"
-            )
-
-    missing = check_dependencies()
-    if missing:
-        prompt_install(
-            "Dépendances manquantes",
-            "Certaines dépendances Python sont absentes :\n- " + "\n- ".join(missing) + "\nVoulez-vous tenter une installation automatique ?",
-        )
-        subprocess.call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
-
-    win = ChatWindow()
-    win.show()
-    app.exec()
