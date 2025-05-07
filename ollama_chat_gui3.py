@@ -46,8 +46,8 @@ if getattr(sys, 'frozen', False):
 else:
     BASE_DIR = Path(__file__).parent
 
-# Remplacement pour utiliser AppData (chemin écrivable)
-#local_appdata = os.getenv("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")
+local_appdata = os.getenv("LOCALAPPDATA")
+DATA_DIR = Path(local_appdata) / "ChatGUI_AI_Local_API"
 #DATA_DIR = Path(local_appdata) / "ChatGUI_AI_Local_API"
 #DATA_DIR.mkdir(parents=True, exist_ok=True)
 #MODEL_DIR = DATA_DIR / "models"
@@ -116,6 +116,7 @@ class Message:
     content: str
     tokens: int = 0
     tok_s: float = 0.0
+    model: str = ""
 
 # --------------------------- Ollama client ---------------------------
 class OllamaClient:
@@ -495,10 +496,11 @@ class ChatWindow(QMainWindow):
                 resp = resp_obj.choices[0].message.content
                 total_tokens = resp_obj.usage.total_tokens
                 tok_s = total_tokens / duration
+                conv.append(Message("assistant", resp, total_tokens, tok_s, model=self.current_model))
             else:
                 resp, total_tokens, tok_s = self.client.chat(self.current_model, payload)
+                conv.append(Message("assistant", resp, total_tokens, tok_s, model=self.current_model))
 
-            conv.append(Message("assistant", resp, total_tokens, tok_s))
             self.stats_label.setText(f"Tokens: {total_tokens} – {tok_s:.1f} tok/s")
             self.render_conversation()
             self._save()
@@ -545,7 +547,12 @@ class ChatWindow(QMainWindow):
         for m in self.conversations.get(self.current_conv_id, []):
             role_class = "role-user" if m.role == "user" else "role-assistant"
             message_class = "user-message" if m.role == "user" else "assistant-message"
-            role_text = "Vous" if m.role == "user" else "IA"
+            if m.role == "user":
+                role_text = "Vous"
+            else:
+                # Affiche le nom du modèle utilisé pour ce message IA
+                model_name = m.model if getattr(m, "model", None) else "IA"
+                role_text = f"IA ({model_name})"
 
             body_raw = m.content
             if m.role == "user":
