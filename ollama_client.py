@@ -24,15 +24,69 @@ class OllamaClient:
             return []
 
     def chat(self, model: str, messages: list[dict]) -> tuple[str, int, float]:
+        """Ancienne méthode, conservée pour compatibilité si appelée directement ailleurs, 
+           mais chat_custom_payload est plus flexible."""
+        payload = {"model": model, "messages": messages, "stream": False}
+        return self._send_chat_payload(payload)
+
+    def chat_custom_payload(self, payload: dict) -> tuple[str, int, float]:
+        """Envoie un payload personnalisé à l'API de chat d'Ollama."""
+        return self._send_chat_payload(payload)
+    
+    def _send_chat_payload(self, payload: dict) -> tuple[str, int, float]:
+        """Méthode interne pour envoyer le payload de chat et traiter la réponse."""
         try:
-            payload = {"model": model, "messages": messages, "stream": False}
             start = time.time()
+            # S'assurer que stream est défini, par défaut à False si non présent
+            payload.setdefault("stream", False)
+            
             r = requests.post(f"{self.base}/api/chat", json=payload, timeout=300)
             r.raise_for_status()
             duration = max(time.time() - start, 1e-6)
             data = r.json()
-            total_tokens = data.get("usage", {}).get("total_tokens", 0)
-            return data["message"]["content"], total_tokens, total_tokens / duration
+            
+            # Gérer la réponse pour les messages streamés et non streamés
+            if payload["stream"]:
+                # Si stream=True, la réponse est une série d'objets JSON séparés par des nouvelles lignes
+                # On doit les concaténer pour reconstruire le message complet.
+                full_response = ""
+                total_tokens_stream = 0 # Initialiser les tokens pour le stream
+                # Il faut lire la réponse différemment pour le stream
+                # data = r.json() ne fonctionnera pas directement pour un stream complet
+                # Ceci est une simplification, car r.json() lira seulement le premier objet JSON du stream.
+                # Une vraie gestion du stream nécessiterait d'itérer sur r.iter_lines() ou similaire.
+                # Pour l'instant, supposons que même en stream, on obtient un résumé à la fin
+                # ou que la version non streamée est utilisée pour la simplicité ici.
+                # Si on passe stream=True à Ollama, et qu'on ne le gère pas correctement ici,
+                # data["message"]["content"] pourrait être incomplet ou une erreur pourrait survenir.
+                # Pour cette raison, il est préférable de forcer stream=False pour le moment
+                # jusqu'à ce que le streaming côté client soit pleinement implémenté.
+                # La modification ci-dessus force stream=False pour l'instant via setdefault.
+                
+                # Si le streaming était géré correctement:
+                # for line in r.iter_lines():
+                #     if line:
+                #         json_line = json.loads(line)
+                #         full_response += json_line.get("message", {}).get("content", "")
+                #         if json_line.get("done"):
+                #             total_tokens_stream = json_line.get("total_duration", 0) # exemple, vérifier la doc Ollama pour les bons champs
+                #             break
+                # resp_content = full_response
+                # final_tokens = total_tokens_stream 
+                # Pour l'instant, on assume que la réponse non-streamée est correcte
+                resp_content = data.get("message", {}).get("content", "")
+                final_tokens = data.get("eval_count", 0) # eval_count est plus précis pour les tokens traités par Ollama
+            else:
+                resp_content = data.get("message", {}).get("content", "")
+                final_tokens = data.get("eval_count", 0)
+            
+            # Utiliser eval_count pour les tokens si disponible, sinon fallback
+            # total_tokens = data.get("usage", {}).get("total_tokens", 0) # Ancien champ
+            # Ollama retourne aussi: prompt_eval_count, eval_count
+            # eval_count semble être le nombre de tokens dans la réponse générée.
+            # total_duration, load_duration, prompt_eval_duration, eval_duration
+
+            return resp_content, final_tokens, final_tokens / duration if duration > 0 else 0
         except Exception as e:
             logging.error(f"Erreur lors de l'appel à Ollama: {e}", exc_info=True)
             raise

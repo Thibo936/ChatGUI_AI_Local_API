@@ -1,3 +1,5 @@
+from dataclasses import asdict
+from pathlib import Path
 import os
 import json
 import re
@@ -5,12 +7,16 @@ import time
 import uuid
 import html
 import logging
-from dataclasses import asdict
-from pathlib import Path
-
+import io
+import base64
+import mimetypes
+import platform
+import subprocess
+import shutil
+import requests
 import psutil
-from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QAction, QTextCursor, QTextOption, QDesktopServices
+from PySide6.QtCore import Qt, QTimer, QUrl, QRunnable, QThreadPool, Signal, Slot, QObject
+from PySide6.QtGui import QAction, QTextCursor, QTextOption, QDesktopServices, QIcon, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QMainWindow,
     QComboBox,
@@ -26,23 +32,70 @@ from PySide6.QtWidgets import (
     QWidget,
     QHBoxLayout,
     QMenu,
+    QFileDialog,
+    QSizePolicy,
 )
 
 from config import SAVE_DIR
-from models import Message
+from models import Message, ModelCaps
 from ollama_client import OllamaClient, is_ollama_running, start_ollama_server
 from utils import log_critical_error
+from file_utils import get_file_type, read_text_file, extract_text_from_pdf, resize_and_encode_image, ocr_image
 
 THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
 
 # Modèles par défaut si aucun n'est disponible
 DEFAULT_MODELS = ["llama2", "mistral", "phi2", "gemma:2b"]
 
+class WorkerSignals(QObject):
+    finished = Signal(object) # Pourrait être tuple(role, content, tokens, tok_s, model)
+    error = Signal(str)
+    stats_updated = Signal(str)
+
+class ApiWorker(QRunnable):
+    def __init__(self, client, model_name_full, api_payload, is_openai):
+        super().__init__()
+        self.client = client # Peut être OllamaClient ou le client OpenAI
+        self.model_name_full = model_name_full
+        self.api_payload = api_payload
+        self.is_openai = is_openai
+        self.signals = WorkerSignals()
+
+    @Slot()
+    def run(self):
+        try:
+            if self.is_openai:
+                model_name = self.model_name_full[len("OpenAI: "):]
+                start = time.time()
+                # Créer le client OpenAI ici pour l'isolation des threads
+                import openai
+                oai_client = openai.OpenAI()
+                resp_obj = oai_client.chat.completions.create(
+                    model=model_name,
+                    messages=self.api_payload,
+                )
+                duration = max(time.time() - start, 1e-6)
+                resp_content = resp_obj.choices[0].message.content
+                total_tokens = resp_obj.usage.total_tokens
+                tok_s = total_tokens / duration
+                result = ("assistant", resp_content, total_tokens, tok_s, self.model_name_full)
+            else: # Ollama
+                # Le client Ollama est supposé être thread-safe pour les requêtes
+                resp_content, total_tokens, tok_s = self.client.chat_custom_payload(self.api_payload)
+                result = ("assistant", resp_content, total_tokens, tok_s, self.model_name_full)
+            
+            self.signals.finished.emit(result)
+            self.signals.stats_updated.emit(f"Tokens: {total_tokens} – {tok_s:.1f} tok/s")
+
+        except Exception as e:
+            log_critical_error(f"Erreur API Worker ({self.model_name_full})", e) 
+            self.signals.error.emit(str(e))
+
 class ChatWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.ollama_available = is_ollama_running()
-        self.setWindowTitle("ChatGUI_AI_Local_API")
+        self.setWindowTitle("ChatGUI AI Local API")
         self.resize(960, 640)
 
         if not self.ollama_available:
@@ -66,13 +119,21 @@ class ChatWindow(QMainWindow):
         self.conversations: dict[str, list[Message]] = {}
         self.current_conv_id: str | None = None
         self.reason_states: dict[str, bool] = {}
+        self.model_capabilities: dict[str, ModelCaps] = {}
+        self.pending_attachments: list[dict] = [] # MODIFIÉ: anciennement self.pending_attachment
+        self.file_content_map = {}  # Nouveau : {file_id: (nom, contenu)}
 
         self.fav_file = SAVE_DIR / "model_favorites.json"
         self.favorites = self._load_model_favorites()
 
+        self.attachments_panel_widget = None
+        self.toggle_files_panel_btn = None
+
         self._setup_ui()
         self._setup_connections()
         self._start_stats_timer()
+        self.threadpool = QThreadPool()
+        logging.info(f"Multithreading with maximum {self.threadpool.maxThreadCount()} threads")
 
         # Remplir la liste des modèles
         self._populate_model_box()
@@ -80,7 +141,10 @@ class ChatWindow(QMainWindow):
         # Sélectionner un modèle s'il y en a
         if self.model_box.count() > 0:
             self.change_model(self.model_box.currentText())
-        
+        else:
+            QMessageBox.warning(self, "Aucun modèle", "Aucun modèle n'a pu être chargé. Vérifiez votre connexion et la configuration d'Ollama/OpenAI.")
+            # Garder les boutons désactivés si aucun modèle
+
         self.load_conversations()
         if not self.conversations:
             self.new_conversation()
@@ -100,9 +164,16 @@ class ChatWindow(QMainWindow):
         self.chat_view = QTextBrowser()
         self.msg_edit = QTextEdit()
         self.send_btn = QPushButton("Envoyer (Ctrl+Enter)")
+        self.attachment_btn = QPushButton()
         self.model_box = QComboBox()
         self.stats_label = QLabel("Tokens: 0 – 0 tok/s")
         self.res_label = QLabel("CPU: 0%  RAM: 0%")
+
+        # Nouveaux widgets pour les pièces jointes
+        self.attached_files_label = QLabel("Fichiers joints :")
+        self.attached_files_list = QListWidget()
+        self.attached_files_list.setMaximumHeight(100) # Hauteur limitée pour la liste
+        self.remove_attachment_btn = QPushButton("Supprimer la sélection")
 
         # Configuration des widgets
         self.chat_view.setOpenExternalLinks(False)
@@ -111,6 +182,15 @@ class ChatWindow(QMainWindow):
         self.msg_edit.setMaximumHeight(150)
         self.model_box.setContextMenuPolicy(Qt.CustomContextMenu)
 
+        # Configurer le bouton de pièce jointe
+        attachment_icon = QIcon.fromTheme("document-open", QIcon(":/qt-project.org/styles/commonstyle/images/standardbutton-open-16.png"))
+        if attachment_icon.isNull():
+            self.attachment_btn.setText("📎")
+        else:
+            self.attachment_btn.setIcon(attachment_icon)
+        self.attachment_btn.setToolTip("Joindre un fichier")
+        self.attachment_btn.setFixedSize(32, 32)
+
         # Mise en page
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
@@ -118,9 +198,10 @@ class ChatWindow(QMainWindow):
         left_layout.addWidget(self.new_conv_btn)
         left_layout.addWidget(self.conv_list, 1)
 
-        editor_bar = QHBoxLayout()
-        editor_bar.addWidget(self.msg_edit, 1)
-        editor_bar.addWidget(self.send_btn)
+        message_input_layout = QHBoxLayout()
+        message_input_layout.addWidget(self.msg_edit, 1)
+        message_input_layout.addWidget(self.attachment_btn)
+        message_input_layout.addWidget(self.send_btn)
 
         bottom_bar = QHBoxLayout()
         bottom_bar.addWidget(self.model_box)
@@ -132,7 +213,22 @@ class ChatWindow(QMainWindow):
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(5, 5, 5, 5)
         right_layout.addWidget(self.chat_view, 1)
-        right_layout.addLayout(editor_bar)
+        right_layout.addLayout(message_input_layout)
+        
+        # Ajout des nouveaux widgets à la mise en page droite
+        self.toggle_files_panel_btn = QPushButton("Fichiers Attachés")
+        self.toggle_files_panel_btn.setCheckable(True)
+        self.toggle_files_panel_btn.setChecked(False)
+        right_layout.addWidget(self.toggle_files_panel_btn)
+
+        self.attachments_panel_widget = QWidget()
+        attachments_panel_layout = QVBoxLayout(self.attachments_panel_widget)
+        attachments_panel_layout.addWidget(self.attached_files_label)
+        attachments_panel_layout.addWidget(self.attached_files_list)
+        attachments_panel_layout.addWidget(self.remove_attachment_btn)
+        self.attachments_panel_widget.setVisible(False)
+        right_layout.addWidget(self.attachments_panel_widget)
+        
         right_layout.addLayout(bottom_bar)
 
         splitter = QSplitter()
@@ -140,6 +236,14 @@ class ChatWindow(QMainWindow):
         splitter.addWidget(right_widget)
         splitter.setStretchFactor(1, 4)
         self.setCentralWidget(splitter)
+
+        # Activer le drag & drop sur la fenêtre principale
+        self.setAcceptDrops(True)
+        # Activer le drag & drop sur le widget QTextEdit
+        self.msg_edit.setAcceptDrops(True)
+        # Remplacer les méthodes pour gérer le drag & drop
+        self.msg_edit.dragEnterEvent = self._msg_edit_drag_enter
+        self.msg_edit.dropEvent = self._msg_edit_drop
 
         # Style CSS
         self.chat_view.document().setDefaultStyleSheet("""
@@ -182,6 +286,19 @@ class ChatWindow(QMainWindow):
                 border-radius: 4px;
                 font-size: 0.9em;
             }
+            .file-header a { text-decoration: none; color: #b5d6fa; }
+            .file-header span { font-style: italic; color: #b5d6fa; }
+            .file-block {
+                border: 1px dashed #b5d6fa;
+                background-color: #232b36;
+                padding: 8px;
+                margin: 4px 0 4px 20px;
+                font-family: monospace;
+                white-space: pre-wrap;
+                word-wrap: break-word;
+                border-radius: 4px;
+                font-size: 0.9em;
+            }
             hr { border: 0; height: 1px; background-color: #ddd; margin: 15px 0; }
         """)
 
@@ -194,10 +311,44 @@ class ChatWindow(QMainWindow):
         self.del_conv_action.triggered.connect(self.delete_conversation)
         self.msg_edit.textChanged.connect(self._auto_resize)
         self.send_btn.clicked.connect(self.send_message)
+        self.attachment_btn.clicked.connect(self._handle_attachment)
         self.model_box.currentTextChanged.connect(self.change_model)
         self.model_box.customContextMenuRequested.connect(self._show_model_context_menu)
         self.chat_view.anchorClicked.connect(self._anchor_clicked)
         self.msg_edit.keyPressEvent = self._key_press_override
+        self.toggle_files_panel_btn.clicked.connect(self._toggle_attachments_panel)
+        self.remove_attachment_btn.clicked.connect(self._remove_selected_attachment)
+
+    def _msg_edit_drag_enter(self, event: QDragEnterEvent):
+        """Acceptation si au moins un fichier local est glissé."""
+        if event.mimeData().hasUrls():
+            # Accepter si au moins un fichier local est présent
+            for url in event.mimeData().urls():
+                if url.isLocalFile():
+                    event.acceptProposedAction()
+                    return
+        # Si c'est du texte standard, on laisse le comportement par défaut
+        elif event.mimeData().hasText():
+            QTextEdit.dragEnterEvent(self.msg_edit, event)
+            return
+        event.ignore()
+
+    def _msg_edit_drop(self, event: QDropEvent):
+        """Traiter chaque fichier glissé comme pièce jointe."""
+        if event.mimeData().hasUrls():
+            # Parcourir tous les fichiers glissés
+            for url in event.mimeData().urls():
+                if url.isLocalFile():
+                    file_path = Path(url.toLocalFile())
+                    if file_path.exists() and file_path.is_file():
+                        self._process_file_attachment(file_path)
+            event.acceptProposedAction()
+            return
+        # Si c'est du texte standard, on laisse le comportement par défaut
+        elif event.mimeData().hasText():
+            QTextEdit.dropEvent(self.msg_edit, event)
+            return
+        event.ignore()
 
     def _start_stats_timer(self):
         self.stats_timer = QTimer(self)
@@ -225,6 +376,7 @@ class ChatWindow(QMainWindow):
     def _populate_model_box(self):
         self.favorites = self._load_model_favorites()
         models = []
+        self.model_capabilities.clear()
         
         # Vérifier si Ollama est disponible
         if not is_ollama_running():
@@ -246,17 +398,34 @@ class ChatWindow(QMainWindow):
             models = DEFAULT_MODELS
             logging.info(f"Utilisation des modèles par défaut: {models}")
                 
+        # Remplir les capacités pour les modèles Ollama (valeurs par défaut pour l'instant)
+        for model_name in models:
+            # Heuristique améliorée pour les modèles vision Ollama
+            known_ollama_vision_models = ["gemma3:4b-it-qat", "gemma3:12b-it-qat","gpt-4.1"] # Modèles explicitement connus pour supporter les images
+            is_vision_model = (
+                "llava" in model_name.lower() or 
+                model_name.lower() in [m.lower() for m in known_ollama_vision_models]
+            )
+            self.model_capabilities[model_name] = ModelCaps(
+                name=model_name,
+                supports_images=is_vision_model,
+                supports_general_files=False, # À affiner
+                max_tokens=4096 # À affiner, peut-être via ollama show
+            )
+
         # Essayer de récupérer les modèles OpenAI
         api_key = os.getenv("OPENAI_API_KEY")
         if api_key:
             try:
                 from openai import OpenAI
+                logging.info("Tentative de récupération des modèles OpenAI...")
                 
                 # Créer un client avec l'API key
-                client = OpenAI(api_key=api_key)
+                client = OpenAI()  # La clé est déjà dans les variables d'environnement
                 
                 # Récupérer la liste des modèles
                 response = client.models.list()
+                logging.info(f"Réponse brute d'OpenAI: {response}")
                 
                 # Filtrer les modèles pour ne garder que ceux qui contiennent "gpt" ou "o3"
                 openai_models = [model.id for model in response.data 
@@ -264,11 +433,28 @@ class ChatWindow(QMainWindow):
                                
                 if openai_models:
                     logging.info(f"Modèles OpenAI récupérés: {openai_models}")
-                    models += [f"OpenAI: {m}" for m in openai_models]
+                    # Remplir les capacités pour les modèles OpenAI
+                    for model_id in openai_models:
+                        # Heuristiques pour les modèles GPT vision et contextes longs
+                        supports_vision = "vision" in model_id.lower()
+                        # GPT-4 Turbo a généralement un contexte plus large
+                        is_turbo = "turbo" in model_id.lower()
+                        max_tokens = 128000 if "gpt-4" in model_id.lower() and is_turbo else (16385 if "gpt-3.5-turbo-16k" in model_id.lower() else 8192 if "gpt-4" in model_id.lower() else 4096)
+
+                        full_model_name = f"OpenAI: {model_id}"
+                        self.model_capabilities[full_model_name] = ModelCaps(
+                            name=full_model_name,
+                            supports_images=supports_vision,
+                            supports_general_files=True, # Les modèles GPT peuvent gérer du texte de fichiers
+                            max_tokens=max_tokens
+                        )
+                        models.append(full_model_name) # Ajouter avec le préfixe
                 else:
-                    logging.warning("Aucun modèle OpenAI correspondant trouvé")
+                    logging.warning("Aucun modèle OpenAI correspondant trouvé dans la réponse")
             except Exception as e:
                 logging.error(f"Erreur lors de la récupération des modèles OpenAI: {e}", exc_info=True)
+        else:
+            logging.warning("Pas de clé API OpenAI trouvée dans les variables d'environnement")
                 
         # Si toujours aucun modèle disponible, afficher un message
         if not models:
@@ -304,6 +490,10 @@ class ChatWindow(QMainWindow):
             # Sélectionner le premier modèle par défaut
             self.model_box.setCurrentIndex(0)
 
+        # Désactiver le bouton Envoyer initialement, sera activé si un modèle est chargé
+        self.send_btn.setEnabled(False)
+        self.attachment_btn.setEnabled(False)
+
     def _show_model_context_menu(self, pos):
         idx = self.model_box.currentIndex()
         if idx < 0:
@@ -336,10 +526,86 @@ class ChatWindow(QMainWindow):
         self.msg_edit.setFixedHeight(min(int(h), 150))
 
     def _key_press_override(self, e):
-        if e.key() in (Qt.Key_Return, Qt.Key_Enter) and not (e.modifiers() & Qt.ShiftModifier):
+        if e.key() in (Qt.Key_Return, Qt.Key_Enter) and e.modifiers() & Qt.ControlModifier:
             self.send_message()
         else:
             QTextEdit.keyPressEvent(self.msg_edit, e)
+
+    def _handle_attachment(self):
+        file_path_str, _ = QFileDialog.getOpenFileName(self, "Sélectionner un fichier", "", "Tous les fichiers (*);;Images (*.png *.jpg *.jpeg *.bmp *.gif);;Documents PDF (*.pdf);;Fichiers Texte (*.txt *.md);;Code (*.py *.js *.html *.css *.java *.c *.cpp)")
+        if file_path_str:
+            file_path = Path(file_path_str)
+            self._process_file_attachment(file_path)
+
+    def _process_file_attachment(self, file_path: Path):
+        if not self.current_model:
+            QMessageBox.warning(self, "Aucun modèle sélectionné", "Veuillez sélectionner un modèle avant de joindre un fichier.")
+            return
+
+        file_type = get_file_type(file_path)
+        model_caps = self.model_capabilities.get(self.current_model)
+
+        if not model_caps:
+            QMessageBox.warning(self, "Capacités du modèle inconnues", f"Impossible de déterminer les capacités pour le modèle {self.current_model}.")
+            return
+
+        # Cas PDF
+        if file_type == "pdf":
+            text_content = extract_text_from_pdf(file_path)
+            if text_content:
+                attachment_data = {"type": "text_content", "content": text_content, "original_filename": file_path.name}
+                if model_caps.supports_general_files or len(text_content) < model_caps.max_tokens * 2:
+                    self.pending_attachments.append(attachment_data) # MODIFIÉ
+                    self.attached_files_list.addItem(f"PDF: {file_path.name}") # Ajout à la liste UI
+                else:
+                    QMessageBox.information(self, "Contenu PDF", "Le contenu du PDF a été extrait, mais pourrait être trop long pour le modèle. Un résumé serait idéal ici.")
+                    attachment_data['content'] = text_content[:model_caps.max_tokens*2] # MODIFIÉ
+                    self.pending_attachments.append(attachment_data) # MODIFIÉ
+                    self.attached_files_list.addItem(f"PDF: {file_path.name}") # Ajout à la liste UI
+            else:
+                QMessageBox.warning(self, "Erreur PDF", f"Impossible d'extraire le texte du PDF {file_path.name}.")
+
+        # Cas Code ou Texte
+        elif file_type in ["code", "text"]:
+            text_content = read_text_file(file_path)
+            if text_content:
+                attachment_data = {"type": "text_content", "content": text_content, "original_filename": file_path.name}
+                if model_caps.supports_general_files or len(text_content) < model_caps.max_tokens * 3:
+                    self.pending_attachments.append(attachment_data) # MODIFIÉ
+                    self.attached_files_list.addItem(f"{file_type.capitalize()}: {file_path.name}") # Ajout à la liste UI
+                else:
+                    QMessageBox.information(self, f"Contenu {file_type.capitalize()}", f"Le contenu du fichier {file_type} a été lu, mais pourrait être trop long. Un résumé/troncature serait idéal ici.")
+                    attachment_data['content'] = text_content[:model_caps.max_tokens*3] # MODIFIÉ
+                    self.pending_attachments.append(attachment_data) # MODIFIÉ
+                    self.attached_files_list.addItem(f"{file_type.capitalize()}: {file_path.name}") # Ajout à la liste UI
+            else:
+                QMessageBox.warning(self, f"Erreur Fichier {file_type.capitalize()}", f"Impossible de lire le fichier {file_path.name}.")
+        # Cas non géré
+        else:
+            QMessageBox.information(self, "Type de fichier non géré", f"Le fichier {file_path.name} de type '{file_type}' n'est pas encore géré ou est inconnu.")
+            return
+
+        if self.pending_attachments and not self.attachments_panel_widget.isVisible():
+            self.toggle_files_panel_btn.setChecked(True)
+            self.attachments_panel_widget.setVisible(True)
+
+    def _toggle_attachments_panel(self):
+        is_checked = self.toggle_files_panel_btn.isChecked()
+        self.attachments_panel_widget.setVisible(is_checked)
+
+    def _remove_selected_attachment(self):
+        current_item = self.attached_files_list.currentItem()
+        if current_item:
+            row = self.attached_files_list.row(current_item)
+            self.attached_files_list.takeItem(row)
+            if 0 <= row < len(self.pending_attachments):
+                del self.pending_attachments[row]
+            if self.attached_files_list.count() == 0 and self.attachments_panel_widget.isVisible():
+                self.toggle_files_panel_btn.setChecked(False)
+                self.attachments_panel_widget.setVisible(False)
+
+    def add_file_placeholder_to_message(self, file_path: Path, contextual_prefix: str):
+        pass # Ne fait plus rien pour l'instant, géré par la liste
 
     def new_conversation(self):
         cid = str(uuid.uuid4())
@@ -351,55 +617,130 @@ class ChatWindow(QMainWindow):
         self.conv_list.setCurrentItem(item)
         self.chat_view.clear()
         self.reason_states.clear()
+        self.pending_attachments.clear()
+        self.attached_files_list.clear() # Vider aussi la liste UI
 
     def switch_conversation(self, item: QListWidgetItem):
         self.current_conv_id = item.data(Qt.UserRole)
         self.reason_states.clear()
-        self.render_conversation()
+        self.pending_attachments.clear()
+        self.attached_files_list.clear() # Vider aussi la liste UI
 
     def change_model(self, _):
         idx = self.model_box.currentIndex()
-        model_name = self.model_box.itemData(idx)
-        self.current_model = model_name
+        if idx < 0 or self.model_box.itemData(idx) is None or self.model_box.itemData(idx) == "Aucun modèle disponible":
+            self.current_model = None
+            self.send_btn.setEnabled(False)
+            self.attachment_btn.setEnabled(False)
+        else:
+            model_name = self.model_box.itemData(idx)
+            self.current_model = model_name
+            self.send_btn.setEnabled(True)
+            self.attachment_btn.setEnabled(True)
 
     def send_message(self):
-        txt = self.msg_edit.toPlainText().strip()
-        if not txt:
+        if not self.current_model:
+            QMessageBox.warning(self, "Aucun modèle", "Veuillez sélectionner un modèle avant d'envoyer un message.")
             return
+
+        txt = self.msg_edit.toPlainText().strip()
+        if not txt and not self.pending_attachments:
+            QMessageBox.warning(self, "Message vide", "Veuillez écrire un message ou joindre un fichier.")
+            return
+        
+        # Nettoyer le placeholder du fichier dans le texte si on envoie vraiment quelque chose
+        user_text_input = re.sub(r"\n\[(Image|PDF|Code|Texte).*?:.*?\s*\]", "", txt).strip()
         self.msg_edit.clear()
 
         conv = self.conversations[self.current_conv_id]
-        conv.append(Message("user", txt))
+        
+        # Construction du contenu du message utilisateur
+        user_message_parts = []
+        attachments_description_for_history = ""
+
+        # D'abord, le contenu des fichiers joints si présents
+        if self.pending_attachments:
+            for pa_index, pa in enumerate(self.pending_attachments):
+                attachments_description_for_history += f" (Fichier joint: {pa.get('original_filename', 'inconnu')})"
+                if pa['type'] == 'text_content':
+                    # Ajouter un préambule clair pour chaque fichier
+                    file_intro = f"Contenu du fichier '{pa.get('original_filename', 'Fichier sans nom')}':"
+                    user_message_parts.append(f"{file_intro}\n---\n{pa['content']}\n---")
+
+        # Ensuite, le texte tapé par l'utilisateur
+        if user_text_input:
+            if user_message_parts: # S'il y avait déjà des fichiers
+                user_message_parts.append(f"\nQuestion de l'utilisateur concernant les fichiers ci-dessus et/ou autre sujet :\n{user_text_input}")
+            else: # Juste le texte de l'utilisateur
+                user_message_parts.append(user_text_input)
+        elif not user_message_parts: # Ni texte, ni contenu de fichier pertinent
+            QMessageBox.warning(self, "Message vide", "Veuillez écrire un message ou joindre un fichier avec du contenu textuel.")
+            self.send_btn.setEnabled(True)
+            self.msg_edit.setReadOnly(False)
+            return
+        elif user_message_parts and not user_text_input: # Fichiers, mais pas de texte utilisateur explicite
+            user_message_parts.append("\n\nExpliquez le contenu des fichiers fournis ci-dessus.")
+
+        final_user_content = "\n\n".join(user_message_parts).strip()
+
+        conv.append(Message("user", final_user_content)) # Utiliser le contenu final formaté
+        
         if len(conv) == 1:
-            self.conv_list.currentItem().setText(txt.split("\n", 1)[0][:40])
+            title_basis = user_text_input if user_text_input else final_user_content
+            self.conv_list.currentItem().setText(title_basis.split("\n", 1)[0][:40])
         self.render_conversation()
+        self.send_btn.setEnabled(False) # Désactiver pendant la réponse
+        self.msg_edit.setReadOnly(True) # Rendre msg_edit non modifiable pendant la réponse
 
-        payload = [{"role": m.role, "content": m.content} for m in conv]
-        try:
-            if self.current_model and self.current_model.startswith("OpenAI: "):
-                model_name = self.current_model[len("OpenAI: "):]
-                from openai import OpenAI
-                client = OpenAI()
-                start = time.time()
-                resp_obj = client.chat.completions.create(
-                    model=model_name,
-                    messages=payload,
-                )
-                duration = max(time.time() - start, 1e-6)
-                resp = resp_obj.choices[0].message.content
-                total_tokens = resp_obj.usage.total_tokens
-                tok_s = total_tokens / duration
-                conv.append(Message("assistant", resp, total_tokens, tok_s, model=self.current_model))
-            else:
-                resp, total_tokens, tok_s = self.client.chat(self.current_model, payload)
-                conv.append(Message("assistant", resp, total_tokens, tok_s, model=self.current_model))
+        # Le payload API utilisera directement les messages de `conv` qui inclut maintenant le message utilisateur complet
+        api_messages_payload_list = [{"role": m.role, "content": m.content} for m in conv]
 
-            self.stats_label.setText(f"Tokens: {total_tokens} – {tok_s:.1f} tok/s")
-            self.render_conversation()
-            self._save()
-        except Exception as err:
-            log_critical_error("Erreur lors de l'envoi du message", err)
-            QMessageBox.critical(self, "Erreur", str(err))
+        # Préparer le payload final pour Ollama si besoin
+        final_api_payload_for_worker = api_messages_payload_list
+        is_openai_call = self.current_model.startswith("OpenAI:")
+
+        if not is_openai_call: # Ollama
+            ollama_specific_payload = {
+                "model": self.current_model,
+                "messages": api_messages_payload_list, # Contient déjà le message utilisateur complet
+                "stream": False
+            }
+            # La gestion des images pour Ollama (si c'était pour des fichiers binaires) est séparée.
+            # Pour le contenu textuel des fichiers, il est déjà intégré dans `api_messages_payload_list`.
+            final_api_payload_for_worker = ollama_specific_payload
+        # Pour OpenAI, api_messages_payload_list est déjà au bon format si le modèle supporte les messages multiples.
+        # Si le modèle OpenAI est multimodal (ex: vision), la structure du contenu du message utilisateur peut nécessiter un formatage spécifique (liste de dictionnaires type/text, type/image_url), ce qui n'est pas le cas ici car on ne traite que du texte.
+        
+        # Créer et démarrer le worker
+        worker_client = self.client if not is_openai_call else None 
+        worker = ApiWorker(worker_client, self.current_model, final_api_payload_for_worker, is_openai_call)
+        
+        worker.signals.finished.connect(self._handle_api_response)
+        worker.signals.error.connect(self._handle_api_error)
+        # worker.signals.stats_updated.connect(self._update_stats_label) # Déjà géré dans _handle_api_response
+        
+        self.pending_attachments.clear()
+        self.attached_files_list.clear()
+
+        self.threadpool.start(worker)
+
+    def _handle_api_response(self, result):
+        role, content, total_tokens, tok_s, model_used = result
+        conv = self.conversations[self.current_conv_id]
+        conv.append(Message(role, content, total_tokens, tok_s, model=model_used))
+        self.stats_label.setText(f"Tokens: {total_tokens} – {tok_s:.1f} tok/s")
+        self.render_conversation()
+        self._save()
+        self.send_btn.setEnabled(True) # Réactiver après réponse
+        self.msg_edit.setReadOnly(False) # Rendre msg_edit modifiable
+
+    def _handle_api_error(self, error_message):
+        QMessageBox.critical(self, "Erreur API", str(error_message))
+        self.send_btn.setEnabled(True) # Réactiver même en cas d'erreur
+        self.msg_edit.setReadOnly(False) # Rendre msg_edit modifiable
+    
+    def _update_stats_label(self, stats_text):
+        self.stats_label.setText(stats_text)
 
     def _format_assistant(self, txt: str) -> str:
         def _repl(m: re.Match) -> str:
@@ -432,25 +773,57 @@ class ChatWindow(QMainWindow):
         txt = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", txt)
         txt = re.sub(r"\*(.*?)\*", r"<i>\1</i>", txt)
 
-        return txt.replace("\n", "<br>")
+        # Extraction des contenus de fichiers cachés
+        file_data_map = {}
+        for m in re.finditer(r"<filedata id=\"(.*?)\">([\s\S]*?)</filedata>", txt):
+            file_data_map[m.group(1)] = m.group(2)
+        # Ajout du rendu pour les fichiers joints
+        return txt
 
     def render_conversation(self):
-        self.chat_view.clear()
-        html_content = ""
-        for m in self.conversations.get(self.current_conv_id, []):
-            role_class = "role-user" if m.role == "user" else "role-assistant"
-            message_class = "user-message" if m.role == "user" else "assistant-message"
-            if m.role == "user":
-                role_text = "Vous"
-            else:
-                model_name = m.model if getattr(m, "model", None) else "IA"
-                role_text = f"IA ({model_name})"
-
+        if not self.current_conv_id:
+            return
+        conv = self.conversations.get(self.current_conv_id, [])
+        html_content = "<body>"
+        for m in conv:
+            role_class = f"role-{m.role}"
+            role_text = "Utilisateur" if m.role == "user" else "Assistant"
+            message_class = "message-user" if m.role == "user" else "message-assistant"
+            
             body_raw = m.content
+
+            # Extraction et masquage initial des contenus de fichiers pour l'affichage
+            # Les tags <filedata> seront gérés par _format_assistant si c'est un message de l'assistant
+            # ou affichés différemment pour l'utilisateur.
+            
+            # Pour les messages utilisateur, nous échappons le HTML et remplaçons les sauts de ligne.
+            # Nous allons aussi rendre les tags <filecontent> et <filedata> plus lisibles ou interactifs.
             if m.role == "user":
-                body_formatted = html.escape(body_raw).replace("\n", "<br>")
-            else:
-                body_formatted = self._format_assistant(body_raw)
+                # Remplacer les tags <filecontent> et <filedata> par quelque chose de plus descriptif
+                # ou un placeholder cliquable si on veut cacher/montrer le contenu.
+                # Pour l'instant, on va juste les afficher de manière plus structurée.
+                
+                # D'abord, échapper tout le contenu pour la sécurité
+                display_content = html.escape(body_raw)
+                
+                # Ensuite, formater les blocs de fichiers pour un meilleur affichage
+                def format_user_file_tags(match):
+                    tag_type = match.group(1) # 'filecontent' ou 'filedata'
+                    file_id = match.group(2)
+                    inner_text = match.group(3)
+                    if tag_type == 'filecontent':
+                        return f'<div class="file-header">Fichier joint : {html.escape(inner_text)} (ID: {file_id})</div>'
+                    elif tag_type == 'filedata':
+                        # On pourrait vouloir cacher/montrer ce contenu par défaut
+                        # Pour l'instant, on l'affiche dans un bloc préformaté
+                        return f'<div class="file-block"><pre>{html.escape(inner_text)}</pre></div>'
+                    return match.group(0) # Retourne le tag original si non reconnu (ne devrait pas arriver)
+                
+                display_content = re.sub(r"<(filecontent|filedata) id=\"(.*?)\">([\s\S]*?)</\1>", format_user_file_tags, display_content)
+                
+                body_formatted = display_content.replace("\n", "<br>")
+            else: # Assistant
+                body_formatted = self._format_assistant(body_raw) # _format_assistant gère déjà les <think> et ```code```
 
             html_content += (
                 f'<div class="message-container {message_class}">'
@@ -460,6 +833,7 @@ class ChatWindow(QMainWindow):
                 f'<hr>'
             )
 
+        html_content += "</body>"
         self.chat_view.setHtml(html_content)
         self.chat_view.moveCursor(QTextCursor.End)
 
@@ -472,6 +846,12 @@ class ChatWindow(QMainWindow):
                 self.render_conversation()
             else:
                 logging.warning(f"Could not extract reason ID from URL: {url.toString()}")
+        elif scheme == "file":
+            file_id = url.path() or url.opaque()
+            if file_id:
+                key = f"file_{file_id}"
+                self.reason_states[key] = not self.reason_states.get(key, False)
+                self.render_conversation()
         elif scheme in ["http", "https"]:
             QDesktopServices.openUrl(url)
 
@@ -502,7 +882,7 @@ class ChatWindow(QMainWindow):
                 title = "Conversation"
                 if messages and messages[0].role == 'user':
                     title = messages[0].content.split('\n', 1)[0][:40]
-                elif messages and messages[0].role == 'assistant' and len(messages) > 1 and messages[1].role == 'user':
+                elif messages and messages[0].role == 'assistant' and len(messages > 1) and messages[1].role == 'user':
                      title = messages[1].content.split('\n', 1)[0][:40]
 
                 item = QListWidgetItem(title)
@@ -547,3 +927,26 @@ class ChatWindow(QMainWindow):
                     self.switch_conversation(self.conv_list.currentItem())
                 else:
                     self.new_conversation()
+
+    # --- Début des méthodes pour Drag & Drop ---
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            # Vérifier si c'est un seul fichier (on ne gère pas le multi-drop pour l'instant)
+            if len(event.mimeData().urls()) == 1:
+                url = event.mimeData().urls()[0]
+                if url.isLocalFile():
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def dropEvent(self, event: QDropEvent):
+        if event.mimeData().hasUrls():
+            url = event.mimeData().urls()[0]
+            if url.isLocalFile():
+                file_path = Path(url.toLocalFile())
+                if file_path.exists() and file_path.is_file():
+                    self._process_file_attachment(file_path)
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+    # --- Fin des méthodes pour Drag & Drop ---

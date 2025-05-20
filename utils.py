@@ -9,8 +9,23 @@ import subprocess
 import shutil
 import winreg
 from PySide6.QtWidgets import QMessageBox, QApplication
+import re
 
 from config import LOG_FILE, LOG_FORMATTER, LOG_DATE_FORMAT
+
+class ApiKeyFilter(logging.Filter):
+    def filter(self, record):
+        if isinstance(record.msg, str):
+            record.msg = re.sub(r"sk-[a-zA-Z0-9]{20,}", "sk-••••••••••••••••••••••••", record.msg)
+        if record.args:
+            new_args = []
+            for arg in record.args:
+                if isinstance(arg, str):
+                    new_args.append(re.sub(r"sk-[a-zA-Z0-9]{20,}", "sk-••••••••••••••••••••••••", arg))
+                else:
+                    new_args.append(arg)
+            record.args = tuple(new_args)
+        return True
 
 def setup_logging():
     log_formatter = logging.Formatter(LOG_FORMATTER, datefmt=LOG_DATE_FORMAT)
@@ -27,6 +42,11 @@ def setup_logging():
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(log_formatter)
     root_logger.addHandler(stream_handler)
+
+    # Ajouter le filtre à tous les handlers du root logger
+    api_key_filter = ApiKeyFilter()
+    for handler in root_logger.handlers:
+        handler.addFilter(api_key_filter)
     
     logging.info("Démarrage de ChatGUI_AI_Local_API")
 
