@@ -190,7 +190,8 @@ class ChatWindow(QMainWindow):
         else:
             self.attachment_btn.setIcon(attachment_icon)
         self.attachment_btn.setToolTip("Joindre un fichier")
-        self.attachment_btn.setFixedSize(32, 32)
+        self.attachment_btn.setFixedSize(36, 36)
+        self.attachment_btn.setStyleSheet("QPushButton { border: none; background-color: transparent; }")
 
         # Mise en page
         left_widget = QWidget()
@@ -248,59 +249,71 @@ class ChatWindow(QMainWindow):
 
         # Style CSS
         self.chat_view.document().setDefaultStyleSheet("""
-            body { font-family: sans-serif; line-height: 1.4; }
-            .message-container { margin-bottom: 10px; }
-            .role-user { font-weight: bold; color: #0055cc; }
-            .role-assistant { font-weight: bold; color: #008000; }
+            body { 
+                font-family: "Segoe UI", sans-serif; /* Police plus moderne */
+                line-height: 1.5; 
+                background-color: #2E3440; /* Fond sombre */
+                color: #D8DEE9; /* Texte clair */
+            }
+            .message-container { 
+                margin-bottom: 12px; 
+            }
+            .role-user { 
+                font-weight: bold; 
+                color: #88C0D0; /* Bleu clair pour l'utilisateur */
+                font-size: 0.9em;
+                margin-left: 5px;
+            }
+            .role-assistant { 
+                font-weight: bold; 
+                color: #A3BE8C; /* Vert clair pour l'assistant */
+                font-size: 0.9em;
+                margin-left: 5px;
+            }
             .message-body {
-                padding: 8px 12px;
-                border-radius: 10px;
-                margin-top: 2px;
+                padding: 10px 15px;
+                border-radius: 15px; /* Coins plus arrondis */
+                margin-top: 4px;
                 display: inline-block;
-                max-width: 95%;
+                max-width: 90%; /* Légère réduction pour l'esthétique */
                 white-space: pre-wrap;
                 word-wrap: break-word;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1); /* Ombre subtile */
+            }
+            /* Style spécifique pour les messages utilisateur */
+            .message-user .message-body {
+                background-color: #3B4252; /* Fond légèrement différent pour l'utilisateur */
+                border-bottom-right-radius: 5px; /* Style "bulle" */
+            }
+            /* Style spécifique pour les messages assistant */
+            .message-assistant .message-body {
+                background-color: #434C5E; /* Fond pour l'assistant */
+                border-bottom-left-radius: 5px; /* Style "bulle" */
             }
             .code-block {
-                background-color: #282c34;
-                color: #abb2bf;
-                border: 1px solid #ccc;
-                padding: 10px;
-                margin: 8px 0;
-                font-family: monospace;
-                white-space: pre-wrap;
-                word-wrap: break-word;
-                display: block;
-                border-radius: 4px;
-                font-size: 0.9em;
+                background-color: #23272e; /* Fond plus sombre pour le code */
+                color: #D8DEE9; /* Texte clair pour le code */
+                border: 1px solid #4C566A; /* Bordure discrète */
+                padding: 12px;
+                margin: 10px 0;
             }
-            .think-header a { text-decoration: none; color: #c5fac5; }
-            .think-header span { font-style: italic; color: #c5fac5; }
+            .think-header a { text-decoration: none; color: #EBCB8B; } /* Jaune pour les liens "think" */
+            .think-header span { font-style: italic; color: #EBCB8B; }
             .think-block {
-                border: 1px dashed #999;
-                background-color: #454c59;
-                padding: 8px;
-                margin: 4px 0 4px 20px;
-                font-family: monospace;
-                white-space: pre-wrap;
-                word-wrap: break-word;
-                border-radius: 4px;
-                font-size: 0.9em;
+                border: 1px dashed #4C566A; /* Bordure discrète */
+                background-color: #3B4252; /* Fond pour les pensées */
+                padding: 10px;
+                margin: 6px 0 6px 25px; /* Marge ajustée */
             }
-            .file-header a { text-decoration: none; color: #b5d6fa; }
-            .file-header span { font-style: italic; color: #b5d6fa; }
+            .file-header a { text-decoration: none; color: #8FBCBB; } /* Sarcelle pour les liens fichiers */
+            .file-header span { font-style: italic; color: #8FBCBB; }
             .file-block {
-                border: 1px dashed #b5d6fa;
-                background-color: #232b36;
-                padding: 8px;
-                margin: 4px 0 4px 20px;
-                font-family: monospace;
-                white-space: pre-wrap;
-                word-wrap: break-word;
-                border-radius: 4px;
-                font-size: 0.9em;
+                border: 1px dashed #4C566A; /* Bordure discrète */
+                background-color: #3B4252; /* Fond pour les blocs fichiers */
+                padding: 10px;
+                margin: 6px 0 6px 25px; /* Marge ajustée */
             }
-            hr { border: 0; height: 1px; background-color: #ddd; margin: 15px 0; }
+            hr { border: 0; height: 1px; background-color: #4C566A; margin: 18px 0; } /* Séparateur plus discret */
         """)
 
     def _setup_connections(self):
@@ -626,6 +639,7 @@ class ChatWindow(QMainWindow):
         self.reason_states.clear()
         self.pending_attachments.clear()
         self.attached_files_list.clear() # Vider aussi la liste UI
+        self.render_conversation() # Ajouter cette ligne pour rafraîchir l'affichage
 
     def change_model(self, _):
         idx = self.model_box.currentIndex()
@@ -904,7 +918,7 @@ class ChatWindow(QMainWindow):
                 title = "Conversation"
                 if messages and messages[0].role == 'user':
                     title = messages[0].content.split('\n', 1)[0][:40]
-                elif messages and messages[0].role == 'assistant' and len(messages > 1) and messages[1].role == 'user':
+                elif messages and messages[0].role == 'assistant' and len(messages) > 1 and messages[1].role == 'user': # Correction: len(messages) > 1
                      title = messages[1].content.split('\n', 1)[0][:40]
 
                 item = QListWidgetItem(title)
