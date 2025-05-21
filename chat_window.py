@@ -15,6 +15,7 @@ import subprocess
 import shutil
 import requests
 import psutil
+import hashlib
 from PySide6.QtCore import Qt, QTimer, QUrl, QRunnable, QThreadPool, Signal, Slot, QObject
 from PySide6.QtGui import QAction, QTextCursor, QTextOption, QDesktopServices, QIcon, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
@@ -663,9 +664,16 @@ class ChatWindow(QMainWindow):
             for pa_index, pa in enumerate(self.pending_attachments):
                 attachments_description_for_history += f" (Fichier joint: {pa.get('original_filename', 'inconnu')})"
                 if pa['type'] == 'text_content':
-                    # Ajouter un préambule clair pour chaque fichier
-                    file_intro = f"Contenu du fichier '{pa.get('original_filename', 'Fichier sans nom')}':"
-                    user_message_parts.append(f"{file_intro}\n---\n{pa['content']}\n---")
+                    # Générer un id unique pour chaque fichier (par exemple hash du nom+contenu)
+                    file_id = hashlib.sha1((pa.get('original_filename','') + pa['content']).encode('utf-8')).hexdigest()[:8]
+                    #file_intro = f"Contenu du fichier '{pa.get('original_filename', 'Fichier sans nom')}' :"
+                    ## Encapsuler le contenu dans un tag filedata masqué par défaut
+                    #user_message_parts.append(
+                    #    f"{file_intro}\n<filedata id=\"{file_id}\">{pa['content']}</filedata>"
+                    #)
+                    user_message_parts.append(
+                        f"<filedata id=\"{file_id}\" name=\"{pa.get('original_filename', 'Fichier sans nom')}\">{pa['content']}</filedata>"
+                )
 
         # Ensuite, le texte tapé par l'utilisateur
         if user_text_input:
@@ -792,36 +800,44 @@ class ChatWindow(QMainWindow):
             
             body_raw = m.content
 
-            # Extraction et masquage initial des contenus de fichiers pour l'affichage
-            # Les tags <filedata> seront gérés par _format_assistant si c'est un message de l'assistant
-            # ou affichés différemment pour l'utilisateur.
-            
-            # Pour les messages utilisateur, nous échappons le HTML et remplaçons les sauts de ligne.
-            # Nous allons aussi rendre les tags <filecontent> et <filedata> plus lisibles ou interactifs.
             if m.role == "user":
-                # Remplacer les tags <filecontent> et <filedata> par quelque chose de plus descriptif
-                # ou un placeholder cliquable si on veut cacher/montrer le contenu.
-                # Pour l'instant, on va juste les afficher de manière plus structurée.
+                final_html_parts = []
+                last_idx = 0
                 
-                # D'abord, échapper tout le contenu pour la sécurité
-                display_content = html.escape(body_raw)
+                # Regex pour trouver les tags <filedata id="..." name="...">...</filedata>
+                # Le contenu du tag (group 3) est brut.
+                for match in re.finditer(r"<filedata id=\"(.*?)\"(?: name=\"([^\"]+)\")?>([\s\S]*?)</filedata>", body_raw):
+                    # Partie avant le tag <filedata>: échapper et remplacer \n par <br>
+                    pre_match_text = body_raw[last_idx:match.start()]
+                    final_html_parts.append(html.escape(pre_match_text).replace("\n", "<br>"))
+                    
+                    # Traiter le tag <filedata>
+                    file_id = match.group(1)
+                    file_name = match.group(2) if match.group(2) else "Fichier joint" # Nom depuis l'attribut name
+                    raw_file_content = match.group(3) # Contenu brut du fichier
+
+                    expanded = self.reason_states.get(f"userfile_{file_id}", False)
+                    arrow = "▼" if expanded else "▶"
+                    
+                    # Échapper le nom du fichier pour l'affichage dans le header
+                    safe_file_name = html.escape(file_name)
+                    header_html = f'<div class="file-header"><a href="userfile:{file_id}">{arrow}</a> <span>{safe_file_name} (cliquer pour afficher/masquer)</span></div>'
+                    final_html_parts.append(header_html)
+                    
+                    if expanded:
+                        # Échapper le contenu du fichier pour l'affichage dans <pre>
+                        escaped_file_content = html.escape(raw_file_content)
+                        # <pre> gère les \n nativement, donc pas de .replace("\n", "<br>") ici.
+                        file_block_html = f'<div class="file-block"><pre>{escaped_file_content}</pre></div>'
+                        final_html_parts.append(file_block_html)
+                    
+                    last_idx = match.end()
                 
-                # Ensuite, formater les blocs de fichiers pour un meilleur affichage
-                def format_user_file_tags(match):
-                    tag_type = match.group(1) # 'filecontent' ou 'filedata'
-                    file_id = match.group(2)
-                    inner_text = match.group(3)
-                    if tag_type == 'filecontent':
-                        return f'<div class="file-header">Fichier joint : {html.escape(inner_text)} (ID: {file_id})</div>'
-                    elif tag_type == 'filedata':
-                        # On pourrait vouloir cacher/montrer ce contenu par défaut
-                        # Pour l'instant, on l'affiche dans un bloc préformaté
-                        return f'<div class="file-block"><pre>{html.escape(inner_text)}</pre></div>'
-                    return match.group(0) # Retourne le tag original si non reconnu (ne devrait pas arriver)
+                # Partie après le dernier tag <filedata> (ou tout le message si aucun tag)
+                post_match_text = body_raw[last_idx:]
+                final_html_parts.append(html.escape(post_match_text).replace("\n", "<br>"))
                 
-                display_content = re.sub(r"<(filecontent|filedata) id=\"(.*?)\">([\s\S]*?)</\1>", format_user_file_tags, display_content)
-                
-                body_formatted = display_content.replace("\n", "<br>")
+                body_formatted = "".join(final_html_parts)
             else: # Assistant
                 body_formatted = self._format_assistant(body_raw) # _format_assistant gère déjà les <think> et ```code```
 
@@ -850,6 +866,12 @@ class ChatWindow(QMainWindow):
             file_id = url.path() or url.opaque()
             if file_id:
                 key = f"file_{file_id}"
+                self.reason_states[key] = not self.reason_states.get(key, False)
+                self.render_conversation()
+        elif scheme == "userfile":
+            file_id = url.path() or url.opaque()
+            if file_id:
+                key = f"userfile_{file_id}"
                 self.reason_states[key] = not self.reason_states.get(key, False)
                 self.render_conversation()
         elif scheme in ["http", "https"]:
