@@ -17,8 +17,9 @@ import requests
 import psutil
 import hashlib
 from PySide6.QtCore import Qt, QTimer, QUrl, QRunnable, QThreadPool, Signal, Slot, QObject
-from PySide6.QtGui import QAction, QTextCursor, QTextOption, QDesktopServices, QIcon, QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QAction, QTextCursor, QTextOption, QDesktopServices, QIcon, QDragEnterEvent, QDropEvent, QCursor
 from PySide6.QtWidgets import (
+    QApplication,
     QMainWindow,
     QComboBox,
     QLabel,
@@ -35,6 +36,10 @@ from PySide6.QtWidgets import (
     QMenu,
     QFileDialog,
     QSizePolicy,
+    QDialog,
+    QCheckBox,
+    QScrollArea,
+    QToolTip,
 )
 
 from config import SAVE_DIR
@@ -92,6 +97,29 @@ class ApiWorker(QRunnable):
             log_critical_error(f"Erreur API Worker ({self.model_name_full})", e) 
             self.signals.error.emit(str(e))
 
+class ModelVisibilityDialog(QDialog):
+    def __init__(self, all_models, visible_models, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Gérer la visibilité des modèles")
+        self.all_models = all_models
+        self.visible_models = visible_models
+
+        self.layout = QVBoxLayout(self)
+        self.checkboxes = []
+
+        for model in all_models:
+            checkbox = QCheckBox(model, self)
+            checkbox.setChecked(model in visible_models)
+            self.layout.addWidget(checkbox)
+            self.checkboxes.append(checkbox)
+
+        self.save_button = QPushButton("Sauvegarder", self)
+        self.save_button.clicked.connect(self.accept)
+        self.layout.addWidget(self.save_button)
+
+    def get_selected_models(self):
+        return [checkbox.text() for checkbox in self.checkboxes if checkbox.isChecked()]
+
 class ChatWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -121,14 +149,16 @@ class ChatWindow(QMainWindow):
         self.current_conv_id: str | None = None
         self.reason_states: dict[str, bool] = {}
         self.model_capabilities: dict[str, ModelCaps] = {}
-        self.pending_attachments: list[dict] = [] # MODIFIÉ: anciennement self.pending_attachment
-        self.file_content_map = {}  # Nouveau : {file_id: (nom, contenu)}
+        self.pending_attachments: list[dict] = [] 
+        self.file_content_map = {}
+        self.code_block_contents: dict[str, str] = {}
 
-        self.fav_file = SAVE_DIR / "model_favorites.json"
-        self.favorites = self._load_model_favorites()
+        self.model_visibility_config_file = SAVE_DIR / "model_visibility.json"
+        self.visible_models: list[str] | None = self._load_model_visibility_config() # Charger au démarrage
 
         self.attachments_panel_widget = None
         self.toggle_files_panel_btn = None
+        self.model_settings_btn = None
 
         self._setup_ui()
         self._setup_connections()
@@ -158,6 +188,113 @@ class ChatWindow(QMainWindow):
                     self.switch_conversation(item)
                     break
 
+    def _load_model_visibility_config(self) -> list[str] | None:
+        if not self.model_visibility_config_file.exists():
+            return None  # Aucun fichier de config, afficher tous les modèles
+        try:
+            data = json.loads(self.model_visibility_config_file.read_text(encoding='utf-8'))
+            if isinstance(data, list):
+                return data
+        except Exception as e:
+            logging.error(f"Erreur lors du chargement de la configuration de visibilité des modèles: {e}", exc_info=True)
+        return None # En cas d'erreur ou de format incorrect, afficher tout
+
+    def _save_model_visibility_config(self):
+        if self.visible_models is None: # Si None, ne pas créer de fichier pour que tout reste visible
+            if self.model_visibility_config_file.exists():
+                 # Si l'utilisateur veut à nouveau tout voir, on pourrait supprimer le fichier
+                 # ou y écrire une liste vide (selon la convention choisie)
+                 # Pour l'instant, si visible_models devient None, on ne fait rien pour garder l'état "tout afficher par défaut"
+                 logging.info("Aucune configuration de visibilité des modèles à sauvegarder (tout est visible par défaut).")
+            return
+        try:
+            self.model_visibility_config_file.write_text(json.dumps(self.visible_models, ensure_ascii=False, indent=2), encoding='utf-8')
+            logging.info(f"Configuration de visibilité des modèles sauvegardée dans {self.model_visibility_config_file}")
+        except Exception as e:
+            logging.error(f"Erreur lors de la sauvegarde de la configuration de visibilité des modèles: {e}", exc_info=True)
+
+    def _open_model_visibility_settings(self):
+        # Récupérer tous les modèles uniques, qu'ils soient actuellement visibles ou non.
+        # Cela nécessite de faire une passe de découverte similaire à _populate_model_box,
+        # mais sans appliquer le filtre de visibilité initialement.
+        all_discovered_models = self._get_all_discovered_models()
+
+        if not all_discovered_models:
+            QMessageBox.information(self, "Aucun modèle trouvé", "Impossible de récupérer la liste des modèles disponibles pour configurer leur visibilité.")
+            return
+
+        # Si self.visible_models est None, cela signifie que tous les modèles sont actuellement considérés comme visibles.
+        # Pour la dialogue, nous avons besoin d'une liste explicite.
+        current_visible_models_for_dialog = self.visible_models
+        if current_visible_models_for_dialog is None:
+            current_visible_models_for_dialog = list(all_discovered_models)
+
+
+        dialog = ModelVisibilityDialog(all_discovered_models, current_visible_models_for_dialog, self)
+        if dialog.exec(): # exec() est bloquant et retourne QDialog.Accepted ou QDialog.Rejected
+            self.visible_models = dialog.get_selected_models()
+            self._save_model_visibility_config()
+            self._populate_model_box() # Rafraîchir la combobox
+            # S'assurer qu'un modèle valide est sélectionné si possible
+            if self.model_box.count() > 0:
+                current_selection = self.model_box.currentData()
+                if not current_selection or current_selection not in self.visible_models:
+                    self.model_box.setCurrentIndex(0) # Sélectionner le premier visible
+                self.change_model(self.model_box.currentText())
+            else: # Aucun modèle n'est visible ou disponible
+                self.current_model = None
+                self.send_btn.setEnabled(False)
+                self.attachment_btn.setEnabled(False)
+                QMessageBox.warning(self, "Aucun modèle visible", "Aucun modèle n'est actuellement sélectionné pour être affiché. Veuillez en choisir dans les paramètres.")
+
+
+    def _get_all_discovered_models(self) -> list[str]:
+        """
+        Récupère tous les modèles disponibles d'Ollama et OpenAI.
+        Similaire au début de _populate_model_box mais sans le filtrage de visibilité.
+        """
+        models = []
+        temp_model_capabilities = {} # Utiliser un temporaire pour ne pas affecter self.model_capabilities
+
+        # Ollama
+        if is_ollama_running():
+            try:
+                ollama_models = self.client.list_models()
+                models.extend(ollama_models)
+                for model_name in ollama_models:
+                    # (Logique de capabilities existante...)
+                    known_ollama_vision_models = ["gemma3:4b-it-qat", "gemma3:12b-it-qat","gpt-4.1"]
+                    is_vision_model = ("llava" in model_name.lower() or model_name.lower() in [m.lower() for m in known_ollama_vision_models])
+                    temp_model_capabilities[model_name] = ModelCaps(name=model_name, supports_images=is_vision_model)
+            except Exception as e:
+                logging.error(f"Erreur (get_all): Récupération modèles Ollama: {e}")
+        elif self.ollama_available: # Si ollama était dispo mais ne l'est plus
+            models.extend(DEFAULT_MODELS) # Fallback aux defauts si ollama ne repond plus
+            for model_name in DEFAULT_MODELS:
+                 temp_model_capabilities[model_name] = ModelCaps(name=model_name)
+
+
+        # OpenAI
+        api_key = os.getenv("OPENAI_API_KEY")
+        if api_key:
+            try:
+                from openai import OpenAI
+                oai_client = OpenAI()
+                response = oai_client.models.list()
+                openai_models = [model.id for model in response.data if "gpt" in model.id.lower() or "o3" in model.id.lower()]
+                for model_id in openai_models:
+                    full_model_name = f"OpenAI: {model_id}"
+                    models.append(full_model_name)
+                    # (Logique de capabilities existante...)
+                    supports_vision = "vision" in model_id.lower()
+                    is_turbo = "turbo" in model_id.lower()
+                    max_tokens = 128000 if "gpt-4" in model_id.lower() and is_turbo else (16385 if "gpt-3.5-turbo-16k" in model_id.lower() else 8192 if "gpt-4" in model_id.lower() else 4096)
+                    temp_model_capabilities[full_model_name] = ModelCaps(name=full_model_name, supports_images=supports_vision, max_tokens=max_tokens, supports_general_files=True)
+            except Exception as e:
+                logging.error(f"Erreur (get_all): Récupération modèles OpenAI: {e}")
+        
+        return sorted(list(dict.fromkeys(models)))
+
     def _setup_ui(self):
         # Création des widgets
         self.new_conv_btn = QPushButton("➕ Nouvelle conversation")
@@ -169,6 +306,10 @@ class ChatWindow(QMainWindow):
         self.model_box = QComboBox()
         self.stats_label = QLabel("Tokens: 0 – 0 tok/s")
         self.res_label = QLabel("CPU: 0%  RAM: 0%")
+        self.model_settings_btn = QPushButton("⚙️") # Ou QPushButton(QIcon.fromTheme("preferences-system"), "")
+        self.model_settings_btn.setToolTip("Paramètres d'affichage des modèles")
+        self.model_settings_btn.setFixedSize(36, 36) # Même taille que attachment_btn
+
 
         # Nouveaux widgets pour les pièces jointes
         self.attached_files_label = QLabel("Fichiers joints :")
@@ -207,6 +348,7 @@ class ChatWindow(QMainWindow):
 
         bottom_bar = QHBoxLayout()
         bottom_bar.addWidget(self.model_box)
+        bottom_bar.addWidget(self.model_settings_btn) # AJOUT DU BOUTON
         bottom_bar.addWidget(self.stats_label)
         bottom_bar.addStretch(1)
         bottom_bar.addWidget(self.res_label)
@@ -250,70 +392,162 @@ class ChatWindow(QMainWindow):
         # Style CSS
         self.chat_view.document().setDefaultStyleSheet("""
             body { 
-                font-family: "Segoe UI", sans-serif; /* Police plus moderne */
-                line-height: 1.5; 
-                background-color: #2E3440; /* Fond sombre */
-                color: #D8DEE9; /* Texte clair */
+                font-family: "Segoe UI", Tahoma, sans-serif;
+                line-height: 1.6; 
+                background-color: #1e1e1e;
+                color: #e4e4e4;
+                margin: 0;
+                padding: 10px;
             }
             .message-container { 
-                margin-bottom: 12px; 
+                margin-bottom: 20px;
+                max-width: 85%;
+            }
+            .message-user {
+                margin-left: auto;
+                margin-right: 0;
+            }
+            .message-assistant {
+                margin-left: 0;
+                margin-right: auto;
             }
             .role-user { 
-                font-weight: bold; 
-                color: #88C0D0; /* Bleu clair pour l'utilisateur */
-                font-size: 0.9em;
-                margin-left: 5px;
+                font-weight: 600; 
+                color: #4fc3f7;
+                font-size: 0.85em;
+                margin-bottom: 6px;
+                display: block;
             }
             .role-assistant { 
-                font-weight: bold; 
-                color: #A3BE8C; /* Vert clair pour l'assistant */
-                font-size: 0.9em;
-                margin-left: 5px;
+                font-weight: 600; 
+                color: #66bb6a;
+                font-size: 0.85em;
+                margin-bottom: 6px;
+                display: block;
             }
             .message-body {
-                padding: 10px 15px;
-                border-radius: 15px; /* Coins plus arrondis */
-                margin-top: 4px;
-                display: inline-block;
-                max-width: 90%; /* Légère réduction pour l'esthétique */
+                padding: 12px 16px;
+                border-radius: 18px;
+                display: block;
                 white-space: pre-wrap;
                 word-wrap: break-word;
-                box-shadow: 0 2px 4px rgba(0,0,0,0.1); /* Ombre subtile */
+                box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+                position: relative;
             }
-            /* Style spécifique pour les messages utilisateur */
             .message-user .message-body {
-                background-color: #3B4252; /* Fond légèrement différent pour l'utilisateur */
-                border-bottom-right-radius: 5px; /* Style "bulle" */
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: #ffffff;
+                border-bottom-right-radius: 6px;
             }
-            /* Style spécifique pour les messages assistant */
             .message-assistant .message-body {
-                background-color: #434C5E; /* Fond pour l'assistant */
-                border-bottom-left-radius: 5px; /* Style "bulle" */
+                background-color: #2d2d2d;
+                color: #e4e4e4;
+                border-bottom-left-radius: 6px;
+            }
+            .code-block-wrapper {
+                position: relative; 
+                margin: 12px 0;
+                border-radius: 8px; 
+                background-color: #2a2a2a; 
+            }
+            .code-block-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 6px 10px;
+            }
+            .code-lang {
+                font-size: 0.85em;
+                color: #ccc;
+                font-family: "Segoe UI", Tahoma, sans-serif;
+            }
+            .copy-btn {
+                text-decoration: none;
+                color: #aaa;
+                font-size: 1.1em; /* Ajuster pour la taille de l'icône/texte */
+                padding: 2px 5px;
+                border-radius: 4px;
+                cursor: pointer;
+            }
+            .copy-btn:hover {
+                color: #fff;
+                background-color: #444;
             }
             .code-block {
-                background-color: #23272e; /* Fond plus sombre pour le code */
-                color: #D8DEE9; /* Texte clair pour le code */
-                border: 1px solid #4C566A; /* Bordure discrète */
-                padding: 12px;
-                margin: 10px 0;
+                background-color: #1a1a1a; /* Fond spécifique au bloc de code */
+                color: #f8f8f2;
+                border-top-left-radius: 0px; 
+                border-top-right-radius: 0px;
+                border-bottom-left-radius: 7px; /* Ajuster pour s'aligner avec le wrapper */
+                border-bottom-right-radius: 7px; /* Ajuster pour s'aligner avec le wrapper */
+                padding: 14px;
+                margin: 0; /* Le wrapper gère la marge extérieure */
+                font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+                font-size: 0.9em;
+                overflow-x: auto;
+                white-space: pre; /* Important pour conserver les espaces et sauts de ligne du code */
             }
-            .think-header a { text-decoration: none; color: #EBCB8B; } /* Jaune pour les liens "think" */
-            .think-header span { font-style: italic; color: #EBCB8B; }
+            .think-header { 
+                background-color: #2a2a2a;
+                padding: 8px 12px;
+                border-radius: 6px;
+                margin: 8px 0 4px 0;
+                border-left: 3px solid #ffa726;
+            }
+            .think-header a { 
+                text-decoration: none; 
+                color: #ffa726;
+                font-weight: bold;
+                margin-right: 8px;
+            }
+            .think-header span { 
+                font-style: italic; 
+                color: #ffa726;
+                font-size: 0.9em;
+            }
             .think-block {
-                border: 1px dashed #4C566A; /* Bordure discrète */
-                background-color: #3B4252; /* Fond pour les pensées */
-                padding: 10px;
-                margin: 6px 0 6px 25px; /* Marge ajustée */
+                background-color: #252525;
+                border: 1px solid #404040;
+                border-radius: 6px;
+                padding: 12px;
+                margin: 4px 0 8px 20px;
+                font-size: 0.9em;
+                color: #cccccc;
             }
-            .file-header a { text-decoration: none; color: #8FBCBB; } /* Sarcelle pour les liens fichiers */
-            .file-header span { font-style: italic; color: #8FBCBB; }
+            .file-header { 
+                background-color: #2a2a2a;
+                padding: 8px 12px;
+                border-radius: 6px;
+                margin: 8px 0 4px 0;
+                border-left: 3px solid #26c6da;
+            }
+            .file-header a { 
+                text-decoration: none; 
+                color: #26c6da;
+                font-weight: bold;
+                margin-right: 8px;
+            }
+            .file-header span { 
+                font-style: italic; 
+                color: #26c6da;
+                font-size: 0.9em;
+            }
             .file-block {
-                border: 1px dashed #4C566A; /* Bordure discrète */
-                background-color: #3B4252; /* Fond pour les blocs fichiers */
-                padding: 10px;
-                margin: 6px 0 6px 25px; /* Marge ajustée */
+                background-color: #252525;
+                border: 1px solid #404040;
+                border-radius: 6px;
+                padding: 12px;
+                margin: 4px 0 8px 20px;
+                font-size: 0.85em;
+                color: #cccccc;
+                max-height: 300px;
+                overflow-y: auto;
             }
-            hr { border: 0; height: 1px; background-color: #4C566A; margin: 18px 0; } /* Séparateur plus discret */
+            hr { 
+                display: none;
+            }
+            b { color: #ffffff; font-weight: 600; }
+            i { color: #b0b0b0; }
         """)
 
     def _setup_connections(self):
@@ -328,10 +562,34 @@ class ChatWindow(QMainWindow):
         self.attachment_btn.clicked.connect(self._handle_attachment)
         self.model_box.currentTextChanged.connect(self.change_model)
         self.model_box.customContextMenuRequested.connect(self._show_model_context_menu)
+        self.model_settings_btn.clicked.connect(self._open_model_visibility_settings)
         self.chat_view.anchorClicked.connect(self._anchor_clicked)
         self.msg_edit.keyPressEvent = self._key_press_override
         self.toggle_files_panel_btn.clicked.connect(self._toggle_attachments_panel)
         self.remove_attachment_btn.clicked.connect(self._remove_selected_attachment)
+
+    def _key_press_override(self, event):
+        # Ctrl+Entrée pour envoyer, sinon comportement normal
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and (event.modifiers() & Qt.ControlModifier):
+            self.send_message()
+        else:
+            QTextEdit.keyPressEvent(self.msg_edit, event)
+
+    def _show_model_context_menu(self, pos):
+        menu = QMenu(self)
+        # Exemple : ajouter une action pour rafraîchir la liste des modèles
+        refresh_action = QAction("Rafraîchir la liste des modèles", self)
+        refresh_action.triggered.connect(self._populate_model_box)
+        menu.addAction(refresh_action)
+        menu.exec(self.model_box.mapToGlobal(pos))
+
+    def _auto_resize(self):
+        doc = self.msg_edit.document()
+        doc_height = doc.size().height()
+        min_height = 40
+        max_height = 150
+        new_height = min(max(doc_height + 10, min_height), max_height)
+        self.msg_edit.setFixedHeight(new_height)
 
     def _msg_edit_drag_enter(self, event: QDragEnterEvent):
         """Acceptation si au moins un fichier local est glissé."""
@@ -374,6 +632,11 @@ class ChatWindow(QMainWindow):
 
     def _load_model_favorites(self) -> list[str]:
         try:
+            if not hasattr(self, 'fav_file'):
+                # Correction : définir le chemin du fichier favoris si absent
+                self.fav_file = SAVE_DIR / "model_favorites.json"
+            if not self.fav_file.exists():
+                return []
             data = json.loads((self.fav_file).read_text(encoding='utf-8'))
             if isinstance(data, list):
                 return data
@@ -383,243 +646,111 @@ class ChatWindow(QMainWindow):
 
     def _save_model_favorites(self):
         try:
+            if not hasattr(self, 'fav_file'):
+                # Correction : définir le chemin du fichier favoris si absent
+                self.fav_file = SAVE_DIR / "model_favorites.json"
             (self.fav_file).write_text(json.dumps(self.favorites, ensure_ascii=False, indent=2), encoding='utf-8')
         except Exception as e:
             logging.error(f"Erreur sauvegarde favoris : {e}", exc_info=True)
 
     def _populate_model_box(self):
         self.favorites = self._load_model_favorites()
-        models = []
+        models_discovered = []
         self.model_capabilities.clear()
         
-        # Vérifier si Ollama est disponible
         if not is_ollama_running():
             self.ollama_available = False
-            logging.warning("Ollama n'est pas en cours d'exécution")
         else:
             self.ollama_available = True
             
         if self.ollama_available:
             try:
-                models = self.client.list_models()
-                logging.info(f"Modèles Ollama récupérés: {models}")
-            except Exception as e:
-                models = []
-                logging.error(f"Erreur lors de la récupération des modèles Ollama: {e}", exc_info=True)
+                ollama_models_list = self.client.list_models()
+                models_discovered.extend(ollama_models_list)
+            except Exception:
+                ollama_models_list = []
                 
-        # Si aucun modèle n'a été récupéré, ajouter les modèles par défaut
-        if not models and self.ollama_available:
-            models = DEFAULT_MODELS
-            logging.info(f"Utilisation des modèles par défaut: {models}")
-                
-        # Remplir les capacités pour les modèles Ollama (valeurs par défaut pour l'instant)
-        for model_name in models:
-            # Heuristique améliorée pour les modèles vision Ollama
-            known_ollama_vision_models = ["gemma3:4b-it-qat", "gemma3:12b-it-qat","gpt-4.1"] # Modèles explicitement connus pour supporter les images
-            is_vision_model = (
-                "llava" in model_name.lower() or 
-                model_name.lower() in [m.lower() for m in known_ollama_vision_models]
-            )
-            self.model_capabilities[model_name] = ModelCaps(
-                name=model_name,
-                supports_images=is_vision_model,
-                supports_general_files=False, # À affiner
-                max_tokens=4096 # À affiner, peut-être via ollama show
-            )
+            if not ollama_models_list:
+                models_discovered.extend(DEFAULT_MODELS)
+                ollama_models_list = list(DEFAULT_MODELS) 
+            
+            for model_name in ollama_models_list:
+                known_ollama_vision_models = ["gemma3:4b-it-qat", "gemma3:12b-it-qat","gpt-4.1"]
+                is_vision_model = (
+                    "llava" in model_name.lower() or 
+                    model_name.lower() in [m.lower() for m in known_ollama_vision_models]
+                )
+                self.model_capabilities[model_name] = ModelCaps(
+                    name=model_name,
+                    supports_images=is_vision_model,
+                    supports_general_files=False,
+                    max_tokens=4096
+                )
 
-        # Essayer de récupérer les modèles OpenAI
         api_key = os.getenv("OPENAI_API_KEY")
         if api_key:
             try:
                 from openai import OpenAI
-                logging.info("Tentative de récupération des modèles OpenAI...")
-                
-                # Créer un client avec l'API key
-                client = OpenAI()  # La clé est déjà dans les variables d'environnement
-                
-                # Récupérer la liste des modèles
-                response = client.models.list()
-                logging.info(f"Réponse brute d'OpenAI: {response}")
-                
-                # Filtrer les modèles pour ne garder que ceux qui contiennent "gpt" ou "o3"
-                openai_models = [model.id for model in response.data 
+                oai_client = OpenAI()
+                response = oai_client.models.list()
+                openai_models_ids = [model.id for model in response.data 
                                if "gpt" in model.id.lower() or "o3" in model.id.lower()]
                                
-                if openai_models:
-                    logging.info(f"Modèles OpenAI récupérés: {openai_models}")
-                    # Remplir les capacités pour les modèles OpenAI
-                    for model_id in openai_models:
-                        # Heuristiques pour les modèles GPT vision et contextes longs
+                if openai_models_ids:
+                    for model_id in openai_models_ids:
                         supports_vision = "vision" in model_id.lower()
-                        # GPT-4 Turbo a généralement un contexte plus large
                         is_turbo = "turbo" in model_id.lower()
                         max_tokens = 128000 if "gpt-4" in model_id.lower() and is_turbo else (16385 if "gpt-3.5-turbo-16k" in model_id.lower() else 8192 if "gpt-4" in model_id.lower() else 4096)
-
                         full_model_name = f"OpenAI: {model_id}"
                         self.model_capabilities[full_model_name] = ModelCaps(
                             name=full_model_name,
                             supports_images=supports_vision,
-                            supports_general_files=True, # Les modèles GPT peuvent gérer du texte de fichiers
+                            supports_general_files=True,
                             max_tokens=max_tokens
                         )
-                        models.append(full_model_name) # Ajouter avec le préfixe
-                else:
-                    logging.warning("Aucun modèle OpenAI correspondant trouvé dans la réponse")
-            except Exception as e:
-                logging.error(f"Erreur lors de la récupération des modèles OpenAI: {e}", exc_info=True)
+                        models_discovered.append(full_model_name)
+            except Exception:
+                pass
+        
+        all_models_available_after_discovery = sorted(list(dict.fromkeys(models_discovered)))
+
+        models_to_list_in_box = []
+        if self.visible_models is None:
+            models_to_list_in_box = list(all_models_available_after_discovery)
         else:
-            logging.warning("Pas de clé API OpenAI trouvée dans les variables d'environnement")
-                
-        # Si toujours aucun modèle disponible, afficher un message
-        if not models:
+            models_to_list_in_box = [m for m in all_models_available_after_discovery if m in self.visible_models]
+
+        if not all_models_available_after_discovery:
             QMessageBox.warning(
                 self,
                 "Aucun modèle disponible",
                 "Aucun modèle n'a été trouvé. Assurez-vous qu'Ollama est en cours d'exécution ou que votre clé API OpenAI est valide."
             )
-            # Ajouter un modèle factice pour éviter les erreurs
-            models = ["Aucun modèle disponible"]
+        elif not models_to_list_in_box and all_models_available_after_discovery:
+             QMessageBox.information(self, "Modèles filtrés", "Tous les modèles disponibles sont actuellement masqués par vos paramètres d'affichage.")
             
-        # Dédupliquer et trier les modèles
-        models = list(dict.fromkeys(models))
-        favs = [m for m in self.favorites if m in models]
-        oth = sorted([m for m in models if m not in self.favorites])
+        favs_in_visible = [m for m in self.favorites if m in models_to_list_in_box]
+        oth_in_visible = sorted([m for m in models_to_list_in_box if m not in favs_in_visible])
         
-        # Sauvegarder le modèle courant
         prev = self.current_model
         
-        # Remplir la combobox
         self.model_box.clear()
-        for m in favs:
+        for m in favs_in_visible:
             self.model_box.addItem(f"★ {m}", m)
-        for m in oth:
+        for m in oth_in_visible:
             self.model_box.addItem(m, m)
             
-        # Restaurer le modèle précédent s'il existe encore
-        if prev:
+        if prev and prev in models_to_list_in_box:
             i = self.model_box.findData(prev)
             if i >= 0:
                 self.model_box.setCurrentIndex(i)
         elif self.model_box.count() > 0:
-            # Sélectionner le premier modèle par défaut
             self.model_box.setCurrentIndex(0)
 
-        # Désactiver le bouton Envoyer initialement, sera activé si un modèle est chargé
-        self.send_btn.setEnabled(False)
-        self.attachment_btn.setEnabled(False)
-
-    def _show_model_context_menu(self, pos):
-        idx = self.model_box.currentIndex()
-        if idx < 0:
-            return
-        model_name = self.model_box.itemData(idx)
-        if not model_name:
-            return
-        menu = QMenu(self)
-        if model_name in self.favorites:
-            action = menu.addAction("Retirer des favoris")
+        if self.model_box.count() > 0:
+             self.change_model(self.model_box.currentText())
         else:
-            action = menu.addAction("Ajouter aux favoris")
-        action.triggered.connect(lambda: self._toggle_favorite(model_name))
-        menu.exec(self.model_box.mapToGlobal(pos))
-
-    def _toggle_favorite(self, model_name: str):
-        if model_name in self.favorites:
-            self.favorites.remove(model_name)
-        else:
-            self.favorites.append(model_name)
-        self._save_model_favorites()
-        prev = self.model_box.currentText()
-        self._populate_model_box()
-        idx = self.model_box.findText(prev)
-        if idx >= 0:
-            self.model_box.setCurrentIndex(idx)
-
-    def _auto_resize(self):
-        h = self.msg_edit.document().size().height() + 10
-        self.msg_edit.setFixedHeight(min(int(h), 150))
-
-    def _key_press_override(self, e):
-        if e.key() in (Qt.Key_Return, Qt.Key_Enter) and e.modifiers() & Qt.ControlModifier:
-            self.send_message()
-        else:
-            QTextEdit.keyPressEvent(self.msg_edit, e)
-
-    def _handle_attachment(self):
-        file_path_str, _ = QFileDialog.getOpenFileName(self, "Sélectionner un fichier", "", "Tous les fichiers (*);;Images (*.png *.jpg *.jpeg *.bmp *.gif);;Documents PDF (*.pdf);;Fichiers Texte (*.txt *.md);;Code (*.py *.js *.html *.css *.java *.c *.cpp)")
-        if file_path_str:
-            file_path = Path(file_path_str)
-            self._process_file_attachment(file_path)
-
-    def _process_file_attachment(self, file_path: Path):
-        if not self.current_model:
-            QMessageBox.warning(self, "Aucun modèle sélectionné", "Veuillez sélectionner un modèle avant de joindre un fichier.")
-            return
-
-        file_type = get_file_type(file_path)
-        model_caps = self.model_capabilities.get(self.current_model)
-
-        if not model_caps:
-            QMessageBox.warning(self, "Capacités du modèle inconnues", f"Impossible de déterminer les capacités pour le modèle {self.current_model}.")
-            return
-
-        # Cas PDF
-        if file_type == "pdf":
-            text_content = extract_text_from_pdf(file_path)
-            if text_content:
-                attachment_data = {"type": "text_content", "content": text_content, "original_filename": file_path.name}
-                if model_caps.supports_general_files or len(text_content) < model_caps.max_tokens * 2:
-                    self.pending_attachments.append(attachment_data) # MODIFIÉ
-                    self.attached_files_list.addItem(f"PDF: {file_path.name}") # Ajout à la liste UI
-                else:
-                    QMessageBox.information(self, "Contenu PDF", "Le contenu du PDF a été extrait, mais pourrait être trop long pour le modèle. Un résumé serait idéal ici.")
-                    attachment_data['content'] = text_content[:model_caps.max_tokens*2] # MODIFIÉ
-                    self.pending_attachments.append(attachment_data) # MODIFIÉ
-                    self.attached_files_list.addItem(f"PDF: {file_path.name}") # Ajout à la liste UI
-            else:
-                QMessageBox.warning(self, "Erreur PDF", f"Impossible d'extraire le texte du PDF {file_path.name}.")
-
-        # Cas Code ou Texte
-        elif file_type in ["code", "text"]:
-            text_content = read_text_file(file_path)
-            if text_content:
-                attachment_data = {"type": "text_content", "content": text_content, "original_filename": file_path.name}
-                if model_caps.supports_general_files or len(text_content) < model_caps.max_tokens * 3:
-                    self.pending_attachments.append(attachment_data) # MODIFIÉ
-                    self.attached_files_list.addItem(f"{file_type.capitalize()}: {file_path.name}") # Ajout à la liste UI
-                else:
-                    QMessageBox.information(self, f"Contenu {file_type.capitalize()}", f"Le contenu du fichier {file_type} a été lu, mais pourrait être trop long. Un résumé/troncature serait idéal ici.")
-                    attachment_data['content'] = text_content[:model_caps.max_tokens*3] # MODIFIÉ
-                    self.pending_attachments.append(attachment_data) # MODIFIÉ
-                    self.attached_files_list.addItem(f"{file_type.capitalize()}: {file_path.name}") # Ajout à la liste UI
-            else:
-                QMessageBox.warning(self, f"Erreur Fichier {file_type.capitalize()}", f"Impossible de lire le fichier {file_path.name}.")
-        # Cas non géré
-        else:
-            QMessageBox.information(self, "Type de fichier non géré", f"Le fichier {file_path.name} de type '{file_type}' n'est pas encore géré ou est inconnu.")
-            return
-
-        if self.pending_attachments and not self.attachments_panel_widget.isVisible():
-            self.toggle_files_panel_btn.setChecked(True)
-            self.attachments_panel_widget.setVisible(True)
-
-    def _toggle_attachments_panel(self):
-        is_checked = self.toggle_files_panel_btn.isChecked()
-        self.attachments_panel_widget.setVisible(is_checked)
-
-    def _remove_selected_attachment(self):
-        current_item = self.attached_files_list.currentItem()
-        if current_item:
-            row = self.attached_files_list.row(current_item)
-            self.attached_files_list.takeItem(row)
-            if 0 <= row < len(self.pending_attachments):
-                del self.pending_attachments[row]
-            if self.attached_files_list.count() == 0 and self.attachments_panel_widget.isVisible():
-                self.toggle_files_panel_btn.setChecked(False)
-                self.attachments_panel_widget.setVisible(False)
-
-    def add_file_placeholder_to_message(self, file_path: Path, contextual_prefix: str):
-        pass # Ne fait plus rien pour l'instant, géré par la liste
+             self.change_model(None)
 
     def new_conversation(self):
         cid = str(uuid.uuid4())
@@ -680,14 +811,9 @@ class ChatWindow(QMainWindow):
                 if pa['type'] == 'text_content':
                     # Générer un id unique pour chaque fichier (par exemple hash du nom+contenu)
                     file_id = hashlib.sha1((pa.get('original_filename','') + pa['content']).encode('utf-8')).hexdigest()[:8]
-                    #file_intro = f"Contenu du fichier '{pa.get('original_filename', 'Fichier sans nom')}' :"
-                    ## Encapsuler le contenu dans un tag filedata masqué par défaut
-                    #user_message_parts.append(
-                    #    f"{file_intro}\n<filedata id=\"{file_id}\">{pa['content']}</filedata>"
-                    #)
                     user_message_parts.append(
                         f"<filedata id=\"{file_id}\" name=\"{pa.get('original_filename', 'Fichier sans nom')}\">{pa['content']}</filedata>"
-                )
+                    )
 
         # Ensuite, le texte tapé par l'utilisateur
         if user_text_input:
@@ -727,19 +853,13 @@ class ChatWindow(QMainWindow):
                 "messages": api_messages_payload_list, # Contient déjà le message utilisateur complet
                 "stream": False
             }
-            # La gestion des images pour Ollama (si c'était pour des fichiers binaires) est séparée.
-            # Pour le contenu textuel des fichiers, il est déjà intégré dans `api_messages_payload_list`.
             final_api_payload_for_worker = ollama_specific_payload
-        # Pour OpenAI, api_messages_payload_list est déjà au bon format si le modèle supporte les messages multiples.
-        # Si le modèle OpenAI est multimodal (ex: vision), la structure du contenu du message utilisateur peut nécessiter un formatage spécifique (liste de dictionnaires type/text, type/image_url), ce qui n'est pas le cas ici car on ne traite que du texte.
         
-        # Créer et démarrer le worker
         worker_client = self.client if not is_openai_call else None 
         worker = ApiWorker(worker_client, self.current_model, final_api_payload_for_worker, is_openai_call)
         
         worker.signals.finished.connect(self._handle_api_response)
         worker.signals.error.connect(self._handle_api_error)
-        # worker.signals.stats_updated.connect(self._update_stats_label) # Déjà géré dans _handle_api_response
         
         self.pending_attachments.clear()
         self.attached_files_list.clear()
@@ -781,12 +901,27 @@ class ChatWindow(QMainWindow):
         txt = THINK_RE.sub(_repl, txt)
 
         def code_repl(m: re.Match) -> str:
-            code = m.group(2).rstrip()
-            escaped_code = html.escape(code)
-            return f'<pre class="code-block">{escaped_code}</pre>'
+            code_id = f"codeblock_{uuid.uuid4().hex[:8]}"
+            lang = m.group(1)
+            code_content = m.group(2).rstrip('\n') 
+            
+            self.code_block_contents[code_id] = code_content
+
+            escaped_code_content = html.escape(code_content)
+            lang_display = html.escape(lang if lang else "code")
+
+            return (
+                f'<div class="code-block-wrapper">'
+                f'  <div class="code-block-header">'
+                f'    <span class="code-lang">{lang_display}</span>'
+                f'    <a href="copycode:{code_id}" class="copy-btn" title="Copier le code">📄</a>'
+                f'  </div>'
+                f'  <pre id="{code_id}" class="code-block">{escaped_code_content}</pre>'
+                f'</div>'
+            )
 
         txt = re.sub(
-            r"```(\w*)?\n(.*?)\n?```",
+            r"```(\w*)?\n(.*?)\n?```", 
             code_repl,
             txt,
             flags=re.DOTALL,
@@ -799,7 +934,6 @@ class ChatWindow(QMainWindow):
         file_data_map = {}
         for m in re.finditer(r"<filedata id=\"(.*?)\">([\s\S]*?)</filedata>", txt):
             file_data_map[m.group(1)] = m.group(2)
-        # Ajout du rendu pour les fichiers joints
         return txt
 
     def render_conversation(self):
@@ -818,49 +952,40 @@ class ChatWindow(QMainWindow):
                 final_html_parts = []
                 last_idx = 0
                 
-                # Regex pour trouver les tags <filedata id="..." name="...">...</filedata>
-                # Le contenu du tag (group 3) est brut.
                 for match in re.finditer(r"<filedata id=\"(.*?)\"(?: name=\"([^\"]+)\")?>([\s\S]*?)</filedata>", body_raw):
-                    # Partie avant le tag <filedata>: échapper et remplacer \n par <br>
                     pre_match_text = body_raw[last_idx:match.start()]
                     final_html_parts.append(html.escape(pre_match_text).replace("\n", "<br>"))
                     
-                    # Traiter le tag <filedata>
                     file_id = match.group(1)
-                    file_name = match.group(2) if match.group(2) else "Fichier joint" # Nom depuis l'attribut name
-                    raw_file_content = match.group(3) # Contenu brut du fichier
+                    file_name = match.group(2) if match.group(2) else "Fichier joint"
+                    raw_file_content = match.group(3)
 
                     expanded = self.reason_states.get(f"userfile_{file_id}", False)
                     arrow = "▼" if expanded else "▶"
                     
-                    # Échapper le nom du fichier pour l'affichage dans le header
                     safe_file_name = html.escape(file_name)
                     header_html = f'<div class="file-header"><a href="userfile:{file_id}">{arrow}</a> <span>{safe_file_name} (cliquer pour afficher/masquer)</span></div>'
                     final_html_parts.append(header_html)
                     
                     if expanded:
-                        # Échapper le contenu du fichier pour l'affichage dans <pre>
                         escaped_file_content = html.escape(raw_file_content)
-                        # <pre> gère les \n nativement, donc pas de .replace("\n", "<br>") ici.
                         file_block_html = f'<div class="file-block"><pre>{escaped_file_content}</pre></div>'
                         final_html_parts.append(file_block_html)
                     
                     last_idx = match.end()
                 
-                # Partie après le dernier tag <filedata> (ou tout le message si aucun tag)
                 post_match_text = body_raw[last_idx:]
                 final_html_parts.append(html.escape(post_match_text).replace("\n", "<br>"))
                 
                 body_formatted = "".join(final_html_parts)
-            else: # Assistant
-                body_formatted = self._format_assistant(body_raw) # _format_assistant gère déjà les <think> et ```code```
+            else:
+                body_formatted = self._format_assistant(body_raw)
 
             html_content += (
                 f'<div class="message-container {message_class}">'
                 f'<span class="{role_class}">{role_text}:</span>'
                 f'<div class="message-body">{body_formatted}</div>'
                 f'</div>'
-                f'<hr>'
             )
 
         html_content += "</body>"
@@ -888,6 +1013,19 @@ class ChatWindow(QMainWindow):
                 key = f"userfile_{file_id}"
                 self.reason_states[key] = not self.reason_states.get(key, False)
                 self.render_conversation()
+        elif scheme == "copycode":
+            code_block_id = url.path() or url.opaque()
+            if code_block_id and code_block_id in self.code_block_contents:
+                text_to_copy = self.code_block_contents[code_block_id]
+                clipboard = QApplication.instance().clipboard()
+                if clipboard:
+                    clipboard.setText(text_to_copy)
+                    QToolTip.showText(QCursor.pos(), "Code copié !", self.chat_view, self.chat_view.rect(), 2000)
+                else:
+                    logging.error("Impossible d'accéder au presse-papiers.")
+            elif code_block_id:
+                logging.warning(f"Contenu du bloc de code non trouvé pour ID: {code_block_id}")
+
         elif scheme in ["http", "https"]:
             QDesktopServices.openUrl(url)
 
@@ -906,7 +1044,7 @@ class ChatWindow(QMainWindow):
         self.conv_list.clear()
         loaded_items = []
         for file_path in SAVE_DIR.glob("*.json"):
-            if file_path.name == "model_favorites.json":
+            if file_path.name == "model_favorites.json" or file_path.name == "model_visibility.json": # MODIFIÉ ICI
                 continue
             try:
                 cid = file_path.stem
@@ -964,12 +1102,9 @@ class ChatWindow(QMainWindow):
                 else:
                     self.new_conversation()
 
-    # --- Début des méthodes pour Drag & Drop ---
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
-            # Vérifier si c'est un seul fichier (on ne gère pas le multi-drop pour l'instant)
-            if len(event.mimeData().urls()) == 1:
-                url = event.mimeData().urls()[0]
+            for url in event.mimeData().urls():
                 if url.isLocalFile():
                     event.acceptProposedAction()
                     return
@@ -977,12 +1112,90 @@ class ChatWindow(QMainWindow):
 
     def dropEvent(self, event: QDropEvent):
         if event.mimeData().hasUrls():
-            url = event.mimeData().urls()[0]
-            if url.isLocalFile():
-                file_path = Path(url.toLocalFile())
-                if file_path.exists() and file_path.is_file():
-                    self._process_file_attachment(file_path)
-                    event.acceptProposedAction()
-                    return
+            for url in event.mimeData().urls():
+                if url.isLocalFile():
+                    file_path = Path(url.toLocalFile())
+                    if file_path.exists() and file_path.is_file():
+                        self._process_file_attachment(file_path)
+            event.acceptProposedAction()
+            return
         event.ignore()
-    # --- Fin des méthodes pour Drag & Drop ---
+
+    def _handle_attachment(self):
+        file_dialog = QFileDialog(self)
+        file_dialog.setFileMode(QFileDialog.ExistingFile)
+        if file_dialog.exec():
+            selected_files = file_dialog.selectedFiles()
+            for file_path in selected_files:
+                self._process_file_attachment(Path(file_path))
+
+    def _toggle_attachments_panel(self):
+        visible = self.toggle_files_panel_btn.isChecked()
+        self.attachments_panel_widget.setVisible(visible)
+
+    def _remove_selected_attachment(self):
+        selected_items = self.attached_files_list.selectedItems()
+        if not selected_items:
+            return
+
+        for item in selected_items:
+            row = self.attached_files_list.row(item)
+            file_display_name = item.text()
+            
+            original_filename_to_remove = None
+            match = re.match(r"^(.*?)\s+\(", file_display_name)
+            if match:
+                original_filename_to_remove = match.group(1)
+
+            if original_filename_to_remove:
+                for i, att in enumerate(self.pending_attachments):
+                    if att.get('original_filename') == original_filename_to_remove:
+                        del self.pending_attachments[i]
+                        break 
+            
+            self.attached_files_list.takeItem(row)
+        
+        self._update_msg_edit_with_attachments()
+
+    def _process_file_attachment(self, file_path: Path):
+        mime_type, _ = mimetypes.guess_type(str(file_path))
+        original_filename = file_path.name
+        file_info = {
+            "original_filename": original_filename,
+            "type": None,
+            "content": None,
+            "path": str(file_path)
+        }
+
+        if mime_type and mime_type.startswith("text"):
+            try:
+                content = read_text_file(file_path)
+                file_info["type"] = "text_content"
+                file_info["content"] = content
+            except Exception as e:
+                QMessageBox.warning(self, "Erreur fichier", f"Impossible de lire le fichier texte : {e}")
+                return
+        elif mime_type and "pdf" in mime_type:
+            try:
+                content = extract_text_from_pdf(file_path)
+                file_info["type"] = "text_content"
+                file_info["content"] = content
+            except Exception as e:
+                QMessageBox.warning(self, "Erreur PDF", f"Impossible de lire le PDF : {e}")
+                return
+        elif mime_type and mime_type.startswith("image"):
+            try:
+                content = ocr_image(file_path)
+                file_info["type"] = "text_content"
+                file_info["content"] = content
+            except Exception as e:
+                QMessageBox.warning(self, "Erreur image", f"Impossible de traiter l'image : {e}")
+                return
+        else:
+            QMessageBox.warning(self, "Type non supporté", "Seuls les fichiers texte, PDF et images sont supportés.")
+            return
+
+        self.pending_attachments.append(file_info)
+        size_kb = file_path.stat().st_size // 1024 + 1
+        item_text = f"{file_info['original_filename']} ({size_kb} KB)"
+        self.attached_files_list.addItem(item_text)
