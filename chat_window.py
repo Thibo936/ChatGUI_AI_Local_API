@@ -7,15 +7,11 @@ import time
 import uuid
 import html
 import logging
-import io
-import base64
 import mimetypes
-import platform
-import subprocess
-import shutil
-import requests
 import psutil
 import hashlib
+import base64
+
 from PySide6.QtCore import Qt, QTimer, QUrl, QRunnable, QThreadPool, Signal, Slot, QObject
 from PySide6.QtGui import QAction, QTextCursor, QTextOption, QDesktopServices, QIcon, QDragEnterEvent, QDropEvent, QCursor
 from PySide6.QtWidgets import (
@@ -46,12 +42,9 @@ from config import SAVE_DIR
 from models import Message, ModelCaps
 from ollama_client import OllamaClient, is_ollama_running, start_ollama_server
 from utils import log_critical_error
-from file_utils import get_file_type, read_text_file, extract_text_from_pdf, resize_and_encode_image, ocr_image
+from file_utils import get_file_type, read_text_file, extract_text_from_pdf, resize_and_encode_image
 
 THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
-
-# Modèles par défaut si aucun n'est disponible
-DEFAULT_MODELS = ["llama2", "mistral", "phi2", "gemma:2b"]
 
 class WorkerSignals(QObject):
     finished = Signal(object) # Pourrait être tuple(role, content, tokens, tok_s, model)
@@ -103,19 +96,78 @@ class ModelVisibilityDialog(QDialog):
         self.setWindowTitle("Gérer la visibilité des modèles")
         self.all_models = all_models
         self.visible_models = visible_models
+        
+        # Définir une taille fixe pour la fenêtre
+        self.setFixedSize(400, 500)  # Largeur: 400px, Hauteur: 500px
 
-        self.layout = QVBoxLayout(self)
+        # Layout principal
+        main_layout = QVBoxLayout(self)
+        
+        # Zone de scroll pour les checkboxes
+        scroll_area = QScrollArea(self)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        
+        # Widget conteneur pour les checkboxes
+        checkboxes_widget = QWidget()
+        checkboxes_layout = QVBoxLayout(checkboxes_widget)
+        checkboxes_layout.setContentsMargins(10, 10, 10, 10)
+        
         self.checkboxes = []
-
+        
+        # Ajouter les checkboxes au layout du conteneur
         for model in all_models:
             checkbox = QCheckBox(model, self)
             checkbox.setChecked(model in visible_models)
-            self.layout.addWidget(checkbox)
+            checkboxes_layout.addWidget(checkbox)
             self.checkboxes.append(checkbox)
-
+        
+        # Ajouter un stretch pour éviter que les checkboxes se répartissent sur toute la hauteur
+        checkboxes_layout.addStretch()
+        
+        # Configurer la zone de scroll
+        scroll_area.setWidget(checkboxes_widget)
+        
+        # Boutons en bas
+        buttons_layout = QHBoxLayout()
+        
+        # Bouton pour tout sélectionner
+        select_all_btn = QPushButton("Tout sélectionner", self)
+        select_all_btn.clicked.connect(self._select_all)
+        buttons_layout.addWidget(select_all_btn)
+        
+        # Bouton pour tout désélectionner  
+        deselect_all_btn = QPushButton("Tout désélectionner", self)
+        deselect_all_btn.clicked.connect(self._deselect_all)
+        buttons_layout.addWidget(deselect_all_btn)
+        
+        buttons_layout.addStretch()
+        
+        # Bouton sauvegarder
         self.save_button = QPushButton("Sauvegarder", self)
         self.save_button.clicked.connect(self.accept)
-        self.layout.addWidget(self.save_button)
+        buttons_layout.addWidget(self.save_button)
+        
+        # Bouton annuler
+        cancel_button = QPushButton("Annuler", self)
+        cancel_button.clicked.connect(self.reject)
+        buttons_layout.addWidget(cancel_button)
+        
+        # Ajouter les éléments au layout principal
+        main_layout.addWidget(QLabel(f"Sélectionnez les modèles à afficher ({len(all_models)} total) :"))
+        main_layout.addWidget(scroll_area, 1)  # Le 1 permet au scroll de prendre tout l'espace disponible
+        main_layout.addLayout(buttons_layout)
+
+    def _select_all(self):
+        """Sélectionner tous les modèles"""
+        for checkbox in self.checkboxes:
+            checkbox.setChecked(True)
+    
+    def _deselect_all(self):
+        """Désélectionner tous les modèles"""
+        for checkbox in self.checkboxes:
+            checkbox.setChecked(False)
 
     def get_selected_models(self):
         return [checkbox.text() for checkbox in self.checkboxes if checkbox.isChecked()]
@@ -150,7 +202,6 @@ class ChatWindow(QMainWindow):
         self.reason_states: dict[str, bool] = {}
         self.model_capabilities: dict[str, ModelCaps] = {}
         self.pending_attachments: list[dict] = [] 
-        self.file_content_map = {}
         self.code_block_contents: dict[str, str] = {}
 
         self.model_visibility_config_file = SAVE_DIR / "model_visibility.json"
@@ -262,9 +313,15 @@ class ChatWindow(QMainWindow):
                 ollama_models = self.client.list_models()
                 models.extend(ollama_models)
                 for model_name in ollama_models:
-                    # (Logique de capabilities existante...)
-                    known_ollama_vision_models = ["gemma3:4b-it-qat", "gemma3:12b-it-qat","gpt-4.1"]
-                    is_vision_model = ("llava" in model_name.lower() or model_name.lower() in [m.lower() for m in known_ollama_vision_models])
+                    vision_prefixes = [
+                        "gemma3", "llama4", "qwen2.5vl", "llava", "llama3.2-vision",
+                        "moondream", "bakllava", "llava-phi3", "granite3.2-vision"
+                    ]
+
+                    is_vision_model = any(
+                        prefix in model_name.lower()
+                        for prefix in vision_prefixes
+                    )
                     temp_model_capabilities[model_name] = ModelCaps(name=model_name, supports_images=is_vision_model)
             except Exception as e:
                 logging.error(f"Erreur (get_all): Récupération modèles Ollama: {e}")
@@ -281,15 +338,58 @@ class ChatWindow(QMainWindow):
                 from openai import OpenAI
                 oai_client = OpenAI()
                 response = oai_client.models.list()
-                openai_models = [model.id for model in response.data if "gpt" in model.id.lower() or "o3" in model.id.lower()]
+                openai_models = [model.id for model in response.data if "gpt" in model.id.lower() or "o1" in model.id.lower() or "o3" in model.id.lower() or "o4" in model.id.lower()]
+                
+                # Liste des modèles OpenAI supportant les images
+                openai_vision_models = {
+                    "o4-mini-2025-04-16", "o3-mini-2025-01-31", "o1-mini-2024-09-12", 
+                    "o3-2025-04-16", "o1-2024-12-17", "o1-pro-2025-03-19", 
+                    "gpt-4.1-2025-04-14", "gpt-4o-2024-08-06", "chatgpt-4o-latest",
+                    "gpt-4.1-mini-2025-04-14", "gpt-4.1-nano-2025-04-14", 
+                    "gpt-4o-mini-2024-07-18", "gpt-image-1", "gpt-4-turbo-2024-04-09"
+                }
+                
                 for model_id in openai_models:
+                    # DEBUG: Afficher chaque modèle trouvé
+                    print(f"Modèle OpenAI trouvé: {model_id}")
+                    
                     full_model_name = f"OpenAI: {model_id}"
                     models.append(full_model_name)
-                    # (Logique de capabilities existante...)
-                    supports_vision = "vision" in model_id.lower()
+                    
+                    # DEBUG: Confirmer l'ajout
+                    print(f"Ajouté à models_discovered: {full_model_name}")
+                    
+                    # Vérifier si le modèle supporte les images
+                    supports_vision = (
+                        model_id in openai_vision_models or 
+                        "vision" in model_id.lower() or
+                        "gpt-4o" in model_id.lower() or
+                        "gpt-4.1" in model_id.lower() or
+                        "gpt-image" in model_id.lower() or
+                        model_id.startswith(("o1", "o3", "o4"))
+                    )
+                    
                     is_turbo = "turbo" in model_id.lower()
-                    max_tokens = 128000 if "gpt-4" in model_id.lower() and is_turbo else (16385 if "gpt-3.5-turbo-16k" in model_id.lower() else 8192 if "gpt-4" in model_id.lower() else 4096)
-                    temp_model_capabilities[full_model_name] = ModelCaps(name=full_model_name, supports_images=supports_vision, max_tokens=max_tokens, supports_general_files=True)
+                    
+                    # Définir les tokens selon le modèle
+                    if "gpt-4" in model_id.lower() and is_turbo:
+                        max_tokens = 128000
+                    elif "gpt-3.5-turbo-16k" in model_id.lower():
+                        max_tokens = 16385
+                    elif "gpt-4" in model_id.lower() or model_id.startswith(("o1", "o3", "o4")):
+                        max_tokens = 128000  # Les nouveaux modèles ont généralement plus de tokens
+                    else:
+                        max_tokens = 4096
+                    
+                    temp_model_capabilities[full_model_name] = ModelCaps(
+                        name=full_model_name, 
+                        supports_images=supports_vision, 
+                        max_tokens=max_tokens, 
+                        supports_general_files=True
+                    )
+                    
+                    # DEBUG: Confirmer l'ajout aux capabilities
+                    print(f"Ajouté aux capabilities: {full_model_name}")
             except Exception as e:
                 logging.error(f"Erreur (get_all): Récupération modèles OpenAI: {e}")
         
@@ -603,7 +703,8 @@ class ChatWindow(QMainWindow):
         elif event.mimeData().hasText():
             QTextEdit.dragEnterEvent(self.msg_edit, event)
             return
-        event.ignore()
+        # Correction : toujours appeler la méthode parente pour les autres cas
+        QTextEdit.dragEnterEvent(self.msg_edit, event)
 
     def _msg_edit_drop(self, event: QDropEvent):
         """Traiter chaque fichier glissé comme pièce jointe."""
@@ -667,48 +768,86 @@ class ChatWindow(QMainWindow):
             try:
                 ollama_models_list = self.client.list_models()
                 models_discovered.extend(ollama_models_list)
+                for model_name in ollama_models_list:
+                    vision_prefixes = [
+                        "gemma3", "llama4", "qwen2.5vl", "llava", "llama3.2-vision",
+                        "moondream", "bakllava", "llava-phi3", "granite3.2-vision"
+                    ]
+
+                    is_vision_model = any(
+                        prefix in model_name.lower()
+                        for prefix in vision_prefixes
+                    )
+                    self.model_capabilities[model_name] = ModelCaps(
+                        name=model_name,
+                        supports_images=is_vision_model,
+                        supports_general_files=False,
+                        max_tokens=4096
+                    )
             except Exception:
                 ollama_models_list = []
                 
             if not ollama_models_list:
-                models_discovered.extend(DEFAULT_MODELS)
-                ollama_models_list = list(DEFAULT_MODELS) 
+                ollama_models_list = []  # <-- Laisser vide
             
-            for model_name in ollama_models_list:
-                known_ollama_vision_models = ["gemma3:4b-it-qat", "gemma3:12b-it-qat","gpt-4.1"]
-                is_vision_model = (
-                    "llava" in model_name.lower() or 
-                    model_name.lower() in [m.lower() for m in known_ollama_vision_models]
-                )
-                self.model_capabilities[model_name] = ModelCaps(
-                    name=model_name,
-                    supports_images=is_vision_model,
-                    supports_general_files=False,
-                    max_tokens=4096
-                )
-
         api_key = os.getenv("OPENAI_API_KEY")
         if api_key:
             try:
                 from openai import OpenAI
                 oai_client = OpenAI()
                 response = oai_client.models.list()
-                openai_models_ids = [model.id for model in response.data 
-                               if "gpt" in model.id.lower() or "o3" in model.id.lower()]
-                               
-                if openai_models_ids:
-                    for model_id in openai_models_ids:
-                        supports_vision = "vision" in model_id.lower()
-                        is_turbo = "turbo" in model_id.lower()
-                        max_tokens = 128000 if "gpt-4" in model_id.lower() and is_turbo else (16385 if "gpt-3.5-turbo-16k" in model_id.lower() else 8192 if "gpt-4" in model_id.lower() else 4096)
-                        full_model_name = f"OpenAI: {model_id}"
-                        self.model_capabilities[full_model_name] = ModelCaps(
-                            name=full_model_name,
-                            supports_images=supports_vision,
-                            supports_general_files=True,
-                            max_tokens=max_tokens
-                        )
-                        models_discovered.append(full_model_name)
+                openai_models = [model.id for model in response.data if "gpt" in model.id.lower() or "o1" in model.id.lower() or "o3" in model.id.lower() or "o4" in model.id.lower()]
+                
+                # Liste des modèles OpenAI supportant les images
+                openai_vision_models = {
+                    "o4-mini-2025-04-16", "o3-mini-2025-01-31", "o1-mini-2024-09-12", 
+                    "o3-2025-04-16", "o1-2024-12-17", "o1-pro-2025-03-19", 
+                    "gpt-4.1-2025-04-14", "gpt-4o-2024-08-06", "chatgpt-4o-latest",
+                    "gpt-4.1-mini-2025-04-14", "gpt-4.1-nano-2025-04-14", 
+                    "gpt-4o-mini-2024-07-18", "gpt-image-1", "gpt-4-turbo-2024-04-09"
+                }
+                
+                for model_id in openai_models:
+                    # DEBUG: Afficher chaque modèle trouvé
+                    print(f"Modèle OpenAI trouvé: {model_id}")
+                    
+                    full_model_name = f"OpenAI: {model_id}"
+                    models_discovered.append(full_model_name)  # CORRECTION: utiliser models_discovered au lieu de models
+                    
+                    # DEBUG: Confirmer l'ajout
+                    print(f"Ajouté à models_discovered: {full_model_name}")
+                    
+                    # Vérifier si le modèle supporte les images
+                    supports_vision = (
+                        model_id in openai_vision_models or 
+                        "vision" in model_id.lower() or
+                        "gpt-4o" in model_id.lower() or
+                        "gpt-4.1" in model_id.lower() or
+                        "gpt-image" in model_id.lower() or
+                        model_id.startswith(("o1", "o3", "o4"))
+                    )
+                    
+                    is_turbo = "turbo" in model_id.lower()
+                    
+                    # Définir les tokens selon le modèle
+                    if "gpt-4" in model_id.lower() and is_turbo:
+                        max_tokens = 128000
+                    elif "gpt-3.5-turbo-16k" in model_id.lower():
+                        max_tokens = 16385
+                    elif "gpt-4" in model_id.lower() or model_id.startswith(("o1", "o3", "o4")):
+                        max_tokens = 128000  # Les nouveaux modèles ont généralement plus de tokens
+                    else:
+                        max_tokens = 4096
+                    
+                    self.model_capabilities[full_model_name] = ModelCaps(
+                        name=full_model_name, 
+                        supports_images=supports_vision, 
+                        max_tokens=max_tokens, 
+                        supports_general_files=True
+                    )
+                    
+                    # DEBUG: Confirmer l'ajout aux capabilities
+                    print(f"Ajouté aux capabilities: {full_model_name}")
             except Exception:
                 pass
         
@@ -794,66 +933,101 @@ class ChatWindow(QMainWindow):
             QMessageBox.warning(self, "Message vide", "Veuillez écrire un message ou joindre un fichier.")
             return
         
-        # Nettoyer le placeholder du fichier dans le texte si on envoie vraiment quelque chose
         user_text_input = re.sub(r"\n\[(Image|PDF|Code|Texte).*?:.*?\s*\]", "", txt).strip()
         self.msg_edit.clear()
 
         conv = self.conversations[self.current_conv_id]
         
-        # Construction du contenu du message utilisateur
-        user_message_parts = []
-        attachments_description_for_history = ""
-
-        # D'abord, le contenu des fichiers joints si présents
-        if self.pending_attachments:
-            for pa_index, pa in enumerate(self.pending_attachments):
-                attachments_description_for_history += f" (Fichier joint: {pa.get('original_filename', 'inconnu')})"
-                if pa['type'] == 'text_content':
-                    # Générer un id unique pour chaque fichier (par exemple hash du nom+contenu)
+        is_openai_call = self.current_model.startswith("OpenAI:")
+        
+        # Préparer le message selon le type d'API
+        if is_openai_call:
+            # Pour OpenAI : gérer les images différemment
+            message_content = []
+            if user_text_input:
+                message_content.append({"type": "text", "text": user_text_input})
+            
+            # Ajouter les images pour OpenAI
+            for pa in self.pending_attachments:
+                if pa['type'] == 'image_base64':
+                    message_content.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{pa['content']}"
+                        }
+                    })
+                elif pa['type'] == 'text_content':
                     file_id = hashlib.sha1((pa.get('original_filename','') + pa['content']).encode('utf-8')).hexdigest()[:8]
-                    user_message_parts.append(
-                        f"<filedata id=\"{file_id}\" name=\"{pa.get('original_filename', 'Fichier sans nom')}\">{pa['content']}</filedata>"
-                    )
+                    text_content = f"\n\n<filedata id=\"{file_id}\" name=\"{pa.get('original_filename', 'Fichier')}\">{pa['content']}</filedata>"
+                    # Ajouter au premier élément text ou créer un nouveau
+                    if message_content and message_content[0]["type"] == "text":
+                        message_content[0]["text"] += text_content
+                    else:
+                        message_content.insert(0, {"type": "text", "text": text_content})
+            
+            # Construire le payload OpenAI
+            api_payload = []
+            for msg in self.conversations[self.current_conv_id]:
+                api_payload.append({"role": msg.role, "content": msg.content})
+            
+            # Message utilisateur pour OpenAI
+            user_msg = {"role": "user", "content": message_content}
+            api_payload.append(user_msg)
+            
+            # Contenu à sauvegarder dans la conversation
+            save_content = user_text_input
+            if self.pending_attachments:
+                for pa in self.pending_attachments:
+                    if pa['type'] == 'text_content':
+                        file_id = hashlib.sha1((pa.get('original_filename','') + pa['content']).encode('utf-8')).hexdigest()[:8]
+                        save_content += f"\n\n<filedata id=\"{file_id}\" name=\"{pa.get('original_filename', 'Fichier')}\">{pa['content']}</filedata>"
+                    elif pa['type'] == 'image_base64':
+                        save_content += f"\n[Image jointe: {pa.get('original_filename', 'image')}]"
+            
+        else:
+            # Pour Ollama : code existant
+            message_content = user_text_input
+            images = []
+            
+            if self.pending_attachments:
+                for pa in self.pending_attachments:
+                    if pa['type'] == 'text_content':
+                        file_id = hashlib.sha1((pa.get('original_filename','') + pa['content']).encode('utf-8')).hexdigest()[:8]
+                        message_content += f"\n\n<filedata id=\"{file_id}\" name=\"{pa.get('original_filename', 'Fichier')}\">{pa['content']}</filedata>"
+                    elif pa['type'] == 'image_base64':
+                        images.append(pa['content'])
+                        message_content += f"\n[Image jointe: {pa.get('original_filename', 'image')}]"
 
-        # Ensuite, le texte tapé par l'utilisateur
-        if user_text_input:
-            if user_message_parts: # S'il y avait déjà des fichiers
-                user_message_parts.append(f"\nQuestion de l'utilisateur concernant les fichiers ci-dessus et/ou autre sujet :\n{user_text_input}")
-            else: # Juste le texte de l'utilisateur
-                user_message_parts.append(user_text_input)
-        elif not user_message_parts: # Ni texte, ni contenu de fichier pertinent
-            QMessageBox.warning(self, "Message vide", "Veuillez écrire un message ou joindre un fichier avec du contenu textuel.")
-            self.send_btn.setEnabled(True)
-            self.msg_edit.setReadOnly(False)
-            return
-        elif user_message_parts and not user_text_input: # Fichiers, mais pas de texte utilisateur explicite
-            user_message_parts.append("\n\nExpliquez le contenu des fichiers fournis ci-dessus.")
+            # Créer le payload pour Ollama
+            api_payload = []
+            for msg in self.conversations[self.current_conv_id]:
+                api_payload.append({"role": msg.role, "content": msg.content})
+            
+            user_msg = {"role": "user", "content": message_content}
+            if images:
+                user_msg["images"] = images
+            
+            api_payload.append(user_msg)
+            save_content = message_content
 
-        final_user_content = "\n\n".join(user_message_parts).strip()
-
-        conv.append(Message("user", final_user_content)) # Utiliser le contenu final formaté
+        conv.append(Message("user", save_content))
         
         if len(conv) == 1:
-            title_basis = user_text_input if user_text_input else final_user_content
+            title_basis = user_text_input if user_text_input else save_content
             self.conv_list.currentItem().setText(title_basis.split("\n", 1)[0][:40])
         self.render_conversation()
-        self.send_btn.setEnabled(False) # Désactiver pendant la réponse
-        self.msg_edit.setReadOnly(True) # Rendre msg_edit non modifiable pendant la réponse
+        self.send_btn.setEnabled(False)
+        self.msg_edit.setReadOnly(True)
 
-        # Le payload API utilisera directement les messages de `conv` qui inclut maintenant le message utilisateur complet
-        api_messages_payload_list = [{"role": m.role, "content": m.content} for m in conv]
-
-        # Préparer le payload final pour Ollama si besoin
-        final_api_payload_for_worker = api_messages_payload_list
-        is_openai_call = self.current_model.startswith("OpenAI:")
-
-        if not is_openai_call: # Ollama
+        if not is_openai_call:
             ollama_specific_payload = {
                 "model": self.current_model,
-                "messages": api_messages_payload_list, # Contient déjà le message utilisateur complet
+                "messages": api_payload,
                 "stream": False
             }
             final_api_payload_for_worker = ollama_specific_payload
+        else:
+            final_api_payload_for_worker = api_payload
         
         worker_client = self.client if not is_openai_call else None 
         worker = ApiWorker(worker_client, self.current_model, final_api_payload_for_worker, is_openai_call)
@@ -1184,12 +1358,28 @@ class ChatWindow(QMainWindow):
                 QMessageBox.warning(self, "Erreur PDF", f"Impossible de lire le PDF : {e}")
                 return
         elif mime_type and mime_type.startswith("image"):
-            try:
-                content = ocr_image(file_path)
-                file_info["type"] = "text_content"
-                file_info["content"] = content
-            except Exception as e:
-                QMessageBox.warning(self, "Erreur image", f"Impossible de traiter l'image : {e}")
+            # Vérifier si le modèle actuel supporte les images
+            if self.current_model and self.current_model in self.model_capabilities:
+                model_caps = self.model_capabilities[self.current_model]
+                if model_caps.supports_images:
+                    # Encoder l'image en base64 pour Ollama (sans le préfixe data:)
+                    try:
+                        # Lire et encoder l'image directement en base64 (comme dans img.py)
+                        with open(file_path, "rb") as img_file:
+                            image_base64 = base64.b64encode(img_file.read()).decode('utf-8')
+                        
+                        file_info["type"] = "image_base64"
+                        file_info["content"] = image_base64  # Base64 pur, sans préfixe
+                    except Exception as e:
+                        QMessageBox.warning(self, "Erreur image", f"Impossible de traiter l'image : {e}")
+                        return
+                else:
+                    QMessageBox.warning(self, "Modèle incompatible", 
+                                      f"Le modèle '{self.current_model}' ne supporte pas les images. "
+                                      "Utilisez un modèle avec vision comme llava ou gemma3.")
+                    return
+            else:
+                QMessageBox.warning(self, "Aucun modèle", "Veuillez sélectionner un modèle supportant les images.")
                 return
         else:
             QMessageBox.warning(self, "Type non supporté", "Seuls les fichiers texte, PDF et images sont supportés.")
@@ -1199,3 +1389,25 @@ class ChatWindow(QMainWindow):
         size_kb = file_path.stat().st_size // 1024 + 1
         item_text = f"{file_info['original_filename']} ({size_kb} KB)"
         self.attached_files_list.addItem(item_text)
+        
+        self._update_msg_edit_with_attachments()
+
+    def _update_msg_edit_with_attachments(self):
+        """Nettoie les placeholders de fichiers joints de msg_edit,
+           car l'information est déjà dans le panneau dédié."""
+        
+        current_text = self.msg_edit.toPlainText()
+        # Enlever tous les placeholders de fichiers joints du msg_edit.
+        # La regex est insensible à la casse et gère les sauts de ligne optionnels.
+        cleaned_text = re.sub(r"\n?\[(Image|PDF|Code|Texte) joint[e]?: [^\]]+\]\s*", "", current_text, flags=re.IGNORECASE)
+        
+        # Si le texte a effectivement été modifié par la suppression des placeholders
+        if cleaned_text != current_text:
+            # Mettre à jour msg_edit avec le texte nettoyé
+            self.msg_edit.setPlainText(cleaned_text.strip()) # .strip() pour enlever les sauts de ligne en fin
+            # Replacer le curseur à la fin du texte
+            cursor = self.msg_edit.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            self.msg_edit.setTextCursor(cursor)
+        # Les nouveaux placeholders ne sont plus ajoutés ici.
+        # L'information sur les fichiers joints est gérée par self.attached_files_list.
